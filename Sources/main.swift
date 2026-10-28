@@ -152,10 +152,11 @@ enum CmdWAction: String, Codable, CaseIterable, Identifiable {
 }
 
 enum NewWindowBehavior: String, Codable, CaseIterable, Identifiable {
-    case sameView, defaultBrowser
+    case newTab, sameView, defaultBrowser
     var id: String { rawValue }
     var title: String {
         switch self {
+        case .newTab: return "새 탭으로 열기"
         case .sameView: return "현재 창에서 열기"
         case .defaultBrowser: return "기본 브라우저에서 열기"
         }
@@ -271,7 +272,7 @@ struct AppConfig: Codable, Equatable {
     // 일반
     var rememberLastPage = true
     var searchEngine: SearchEngine = .google
-    var newWindow: NewWindowBehavior = .sameView
+    var newWindow: NewWindowBehavior = .newTab
     var customUserAgent = ""
 
     // 메모리·소리
@@ -1456,11 +1457,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
 
     func webView(for page: PageConfig) -> WKWebView {
         if let wv = webViews[page.id] { return wv }
-        let cfg = WKWebViewConfiguration()
-        cfg.websiteDataStore = .default() // 로그인 유지
+        return createWebView(for: page)
+    }
+
+    /// popupConfig: 사이트가 새 창을 열 때 WebKit이 넘겨준 설정. 이걸로 만들어야
+    /// 로그인 팝업처럼 원래 페이지와 주고받는(window.opener) 동작이 유지됨. 이때 주소는 WebKit이 직접 불러옴
+    func createWebView(for page: PageConfig, popupConfig: WKWebViewConfiguration? = nil) -> WKWebView {
+        let cfg: WKWebViewConfiguration
+        if let popupConfig {
+            cfg = popupConfig
+        } else {
+            cfg = WKWebViewConfiguration()
+            cfg.websiteDataStore = .default() // 로그인 유지
+            cfg.userContentController.addUserScript(muteScript(page.muted))
+        }
         cfg.preferences.javaScriptCanOpenWindowsAutomatically = true
         cfg.preferences.isElementFullscreenEnabled = true // 영상 전체화면 버튼
-        cfg.userContentController.addUserScript(muteScript(page.muted))
         let wv = WKWebView(frame: container.bounds, configuration: cfg)
         wv.autoresizingMask = [.width, .height]
         wv.allowsBackForwardNavigationGestures = true
@@ -1471,7 +1483,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         wv.uiDelegate = self
         wv.navigationDelegate = self
         if #available(macOS 13.3, *) { wv.isInspectable = true }
-        if let u = resumeURL.removeValue(forKey: page.id) ?? normalizedURL(page.url) {
+        if popupConfig == nil, let u = resumeURL.removeValue(forKey: page.id) ?? normalizedURL(page.url) {
             wv.load(URLRequest(url: u))
         }
         container.addSubview(wv, positioned: .below, relativeTo: nil)
@@ -1910,6 +1922,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        // ⌘+클릭한 링크는 브라우저처럼 뒤쪽 새 탭으로 (현재 탭은 그대로)
+        if navigationAction.navigationType == .linkActivated,
+           navigationAction.modifierFlags.contains(.command),
+           let u = navigationAction.request.url, u.scheme == "http" || u.scheme == "https" {
+            openInNewTab(u, from: webView, activate: false)
+            decisionHandler(.cancel)
+            return
+        }
         decisionHandler(navigationAction.shouldPerformDownload ? .download : .allow)
     }
 
@@ -2237,14 +2257,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
 
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        if navigationAction.targetFrame == nil {
-            if config.newWindow == .defaultBrowser, let u = navigationAction.request.url {
-                NSWorkspace.shared.open(u)
-            } else {
-                webView.load(navigationAction.request)
-            }
+        guard navigationAction.targetFrame == nil else { return nil }
+        switch config.newWindow {
+        case .defaultBrowser:
+            if let u = navigationAction.request.url { NSWorkspace.shared.open(u) }
+            return nil
+        case .sameView:
+            webView.load(navigationAction.request)
+            return nil
+        case .newTab:
+            // WebKit이 준 설정으로 웹뷰를 만들어 돌려줘야 로그인 팝업 등이 정상 동작
+            let page = newTabPage(url: navigationAction.request.url, from: webView)
+            let wv = createWebView(for: page, popupConfig: configuration)
+            insertTab(page, after: webView, activate: true)
+            return wv
         }
-        return nil
+    }
+
+    /// 링크에서 열리는 새 탭: 원래 탭의 화면 종류를 이어받고, 이름·주소는 사이트를 따라감
+    func newTabPage(url: URL?, from source: WKWebView) -> PageConfig {
+        let s = url?.absoluteString ?? ""
+        var page = PageConfig(name: "새 탭", url: s.isEmpty ? "about:blank" : s, autoName: true)
+        if let sid = pageID(of: source), let src = config.pages.first(where: { $0.id == sid }) {
+            page.device = src.device
+        }
+        return page
+    }
+
+    /// 원래 탭 바로 오른쪽에 탭 추가
+    func insertTab(_ page: PageConfig, after source: WKWebView, activate: Bool) {
+        var at = config.pages.count
+        if let sid = pageID(of: source), let i = config.pages.firstIndex(where: { $0.id == sid }) { at = i + 1 }
+        model.config.pages.insert(page, at: min(at, config.pages.count))
+        if activate {
+            currentID = page.id
+            select(currentIndex, showHUD: false)
+        } else {
+            flash("새 탭에서 열림")
+        }
+    }
+
+    func openInNewTab(_ url: URL, from source: WKWebView, activate: Bool) {
+        let page = newTabPage(url: url, from: source)
+        insertTab(page, after: source, activate: activate)
+        if !activate {
+            let wv = webView(for: page) // 뒤에서 미리 불러오기
+            wv.isHidden = true
+        }
+    }
+
+    /// 로그인 팝업처럼 페이지가 스스로 창을 닫으면(window.close) 그 탭도 닫음
+    func webViewDidClose(_ webView: WKWebView) {
+        guard let id = pageID(of: webView), let i = config.pages.firstIndex(where: { $0.id == id }),
+              config.pages.count > 1 else { return }
+        closeTab(at: i)
     }
 
     func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
