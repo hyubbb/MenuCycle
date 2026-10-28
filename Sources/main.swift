@@ -277,6 +277,7 @@ struct AppConfig: Codable, Equatable {
     var alwaysOnTop = true
     var allSpaces = true
     var showTabBar = true
+    var showTabNames = false // 탭에 페이지 이름 표시 (기본: 번호만)
     var showAddressBar = true
     var addressBarAtBottom = true // 주소창 섹션을 창 아래쪽에
     var showHUD = true
@@ -345,6 +346,7 @@ extension AppConfig {
         alwaysOnTop = v(.alwaysOnTop, alwaysOnTop)
         allSpaces = v(.allSpaces, allSpaces)
         showTabBar = v(.showTabBar, showTabBar)
+        showTabNames = v(.showTabNames, showTabNames)
         showAddressBar = v(.showAddressBar, showAddressBar)
         addressBarAtBottom = v(.addressBarAtBottom, addressBarAtBottom)
         showHUD = v(.showHUD, showHUD)
@@ -785,6 +787,8 @@ struct SettingsView: View {
             }
             Section("표시") {
                 Toggle("페이지 탭 막대 표시", isOn: $model.config.showTabBar)
+                Toggle("탭에 페이지 이름 표시 (끄면 번호만 보임)", isOn: $model.config.showTabNames)
+                    .disabled(!model.config.showTabBar)
                 Toggle("주소창 표시", isOn: $model.config.showAddressBar)
                 Picker("주소창 위치", selection: $model.config.addressBarAtBottom) {
                     Text("위 (탭 아래)").tag(false)
@@ -1591,6 +1595,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
 
         if new.showTabBar != old.showTabBar || new.showAddressBar != old.showAddressBar
             || new.addressBarAtBottom != old.addressBarAtBottom { layoutChrome() }
+        if new.showTabNames != old.showTabNames { rebuildTabs() }
         if new.opacity != old.opacity { panel.alphaValue = CGFloat(new.opacity) }
 
         if new.pages != old.pages {
@@ -2535,7 +2540,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     func rebuildTabs() {
         tabStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         for (i, p) in config.pages.enumerated() {
-            let b = TabButton(title: "\(p.incognito ? "🕶 " : "")\(i + 1) \(p.name)\(p.muted ? " 🔇" : "")",
+            // 기본은 번호만 (보고 있는 사이트가 옆사람에게 보이지 않게). 설정에서 이름 표시 가능
+            let label = config.showTabNames ? "\(i + 1) \(p.name)" : "\(i + 1)"
+            let b = TabButton(title: "\(p.incognito ? "🕶 " : "")\(label)\(p.muted ? " 🔇" : "")",
                               target: nil, action: nil)
             b.owner = self
             b.toolTip = "클릭: 열기 · 좌우로 끌기: 순서 변경 · 우클릭: 닫기"
