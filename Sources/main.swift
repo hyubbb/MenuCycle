@@ -221,6 +221,7 @@ struct PageConfig: Codable, Identifiable, Equatable {
     var muted: Bool = false
     var zoom: Double = 1.0
     var refreshMinutes: Int = 0 // 0 = 자동 새로고침 끔
+    var incognito: Bool = false // 시크릿 탭: 쿠키·기록을 남기지 않고, 앱을 끄면 사라짐
 }
 
 extension PageConfig {
@@ -238,6 +239,7 @@ extension PageConfig {
         muted = (try? c.decodeIfPresent(Bool.self, forKey: .muted)) ?? false
         zoom = (try? c.decodeIfPresent(Double.self, forKey: .zoom)) ?? 1.0
         refreshMinutes = (try? c.decodeIfPresent(Int.self, forKey: .refreshMinutes)) ?? 0
+        incognito = (try? c.decodeIfPresent(Bool.self, forKey: .incognito)) ?? false
     }
 }
 
@@ -279,6 +281,7 @@ struct AppConfig: Codable, Equatable {
     // 메모리·소리
     var unloadMinutes = 0       // 0 = 끔. N분 동안 안 본 탭은 메모리에서 내림
     var pauseOnClose = false    // 창을 닫으면 재생 중인 영상·음악 일시정지
+    var recordHistory = true    // 방문 기록 남기기
 
     // 모양
     var opacity: Double = 1.0
@@ -342,6 +345,7 @@ extension AppConfig {
         customUserAgent = v(.customUserAgent, customUserAgent)
         unloadMinutes = v(.unloadMinutes, unloadMinutes)
         pauseOnClose = v(.pauseOnClose, pauseOnClose)
+        recordHistory = v(.recordHistory, recordHistory)
         opacity = v(.opacity, opacity)
         pages = v(.pages, pages)
         version = 2
@@ -378,6 +382,8 @@ enum ConfigStore {
     static func save(_ cfg: AppConfig) {
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .withoutEscapingSlashes, .sortedKeys]
+        var cfg = cfg
+        cfg.pages = cfg.pages.filter { !$0.incognito } // 시크릿 탭은 저장하지 않음
         if let data = try? enc.encode(cfg) {
             try? data.write(to: url, options: .atomic)
         }
@@ -559,6 +565,7 @@ final class SettingsModel: ObservableObject {
 
     var onChange: (() -> Void)?
     var openConfigFile: (() -> Void)?
+    var openHistory: (() -> Void)?
     var reloadConfigFile: (() -> Void)?
 
     init(config: AppConfig) { self.config = config }
@@ -620,6 +627,15 @@ struct SettingsView: View {
                         .frame(width: 300)
                 }
                 Text("파일은 다운로드 폴더에 저장됩니다.").font(.caption).foregroundStyle(.secondary)
+            }
+            Section("방문 기록") {
+                Toggle("방문 기록 남기기 (주소창 자동완성에 사용)", isOn: $model.config.recordHistory)
+                HStack {
+                    Button("방문 기록 보기 · 지우기…") { model.openHistory?() }
+                    Spacer()
+                }
+                Text("시크릿 탭(⌘⇧N)은 기록·쿠키를 남기지 않고, 앱을 끄면 사라집니다.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Section("메모리 · 소리") {
                 Picker("안 본 탭을 메모리에서 내리기", selection: $model.config.unloadMinutes) {
@@ -692,6 +708,8 @@ struct SettingsView: View {
                 LabeledContent("⌘R", value: "새로고침")
                 LabeledContent("⌘[ / ⌘]", value: "뒤로 / 앞으로")
                 LabeledContent("⌘T", value: "새 탭")
+                LabeledContent("⌘⇧N", value: "새 시크릿 탭")
+                LabeledContent("⌘Y", value: "방문 기록")
                 LabeledContent("⌘W / ⌘⇧T", value: "탭 닫기 / 닫은 탭 다시 열기")
                 LabeledContent("⌘F / ⌘G", value: "페이지에서 찾기 / 다음 찾기")
                 LabeledContent("⌘+ / ⌘- / ⌘0", value: "확대 / 축소 / 원래 크기")
@@ -787,6 +805,174 @@ struct SettingsView: View {
 }
 
 // MARK: - 패널 부품
+
+// MARK: - 방문 기록
+
+struct HistoryEntry: Codable, Identifiable, Equatable {
+    var id = UUID()
+    var url: String
+    var title: String
+    var date: Date
+}
+
+/// "https://www.youtube.com/watch" → "youtube.com/watch"
+func strippedURL(_ s: String) -> String {
+    var t = s
+    for p in ["https://", "http://"] where t.hasPrefix(p) { t.removeFirst(p.count) }
+    if t.lowercased().hasPrefix("www.") { t.removeFirst(4) }
+    return t
+}
+
+final class HistoryStore: ObservableObject {
+    @Published private(set) var entries: [HistoryEntry] = [] // 최신이 앞
+    private var saveWork: DispatchWorkItem?
+    let limit = 5000
+
+    static var fileURL: URL {
+        ConfigStore.url.deletingLastPathComponent().appendingPathComponent("history.json")
+    }
+
+    init() {
+        if let d = try? Data(contentsOf: HistoryStore.fileURL),
+           let e = try? JSONDecoder().decode([HistoryEntry].self, from: d) {
+            entries = e
+        }
+    }
+
+    func record(url: URL, title: String?) {
+        guard let scheme = url.scheme, scheme == "http" || scheme == "https" else { return }
+        let s = url.absoluteString
+        let t = title ?? ""
+        if let first = entries.first, first.url == s {
+            if !t.isEmpty { entries[0].title = t }
+            entries[0].date = Date()
+        } else {
+            entries.insert(HistoryEntry(url: s, title: t, date: Date()), at: 0)
+            if entries.count > limit { entries.removeLast(entries.count - limit) }
+        }
+        scheduleSave()
+    }
+
+    /// 페이지 제목은 주소보다 늦게 정해지므로 최근 기록에서 찾아 채움
+    func updateTitle(url: String, title: String) {
+        guard !title.isEmpty, let i = entries.prefix(20).firstIndex(where: { $0.url == url }),
+              entries[i].title != title else { return }
+        entries[i].title = title
+        scheduleSave()
+    }
+
+    func remove(_ id: UUID) {
+        entries.removeAll { $0.id == id }
+        scheduleSave()
+    }
+
+    /// since == nil 이면 전체 삭제
+    func clear(since: Date?) {
+        if let since { entries.removeAll { $0.date >= since } } else { entries.removeAll() }
+        scheduleSave()
+    }
+
+    /// 주소창 자동완성: 입력한 글자로 시작하는 사이트 중 가장 많이 간 곳
+    func complete(_ typed: String) -> String? {
+        let q = typed.lowercased()
+        guard !q.isEmpty, !q.hasPrefix("http") else { return nil }
+        var hosts: [String: Int] = [:]
+        var urls: [String: Int] = [:]
+        for e in entries {
+            let full = strippedURL(e.url)
+            urls[full, default: 0] += 1
+            if let u = URL(string: e.url), var h = u.host?.lowercased() {
+                if h.hasPrefix("www.") { h.removeFirst(4) }
+                hosts[h, default: 0] += 1
+            }
+        }
+        if let h = hosts.filter({ $0.key.hasPrefix(q) }).max(by: { $0.value < $1.value })?.key, h.count > q.count {
+            return h
+        }
+        let best = urls.filter { $0.key.lowercased().hasPrefix(q) && $0.key.count > q.count }
+            .max { a, b in a.value == b.value ? a.key.count > b.key.count : a.value < b.value }
+        return best?.key
+    }
+
+    private func scheduleSave() {
+        saveWork?.cancel()
+        let snapshot = entries
+        let w = DispatchWorkItem {
+            if let d = try? JSONEncoder().encode(snapshot) {
+                try? d.write(to: HistoryStore.fileURL, options: .atomic)
+            }
+        }
+        saveWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: w)
+    }
+}
+
+struct HistoryView: View {
+    @ObservedObject var store: HistoryStore
+    var onOpen: (String, Bool) -> Void // (주소, 새 탭 여부)
+    @State private var query = ""
+    @State private var confirmClear = false
+
+    var filtered: [HistoryEntry] {
+        let q = query.trimmingCharacters(in: .whitespaces).lowercased()
+        let list = q.isEmpty ? store.entries
+            : store.entries.filter { $0.url.lowercased().contains(q) || $0.title.lowercased().contains(q) }
+        return Array(list.prefix(500))
+    }
+
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack {
+                TextField("기록 검색 (제목 또는 주소)", text: $query)
+                    .textFieldStyle(.roundedBorder)
+                Menu("기록 지우기") {
+                    Button("지난 1시간") { store.clear(since: Date().addingTimeInterval(-3600)) }
+                    Button("오늘") { store.clear(since: Calendar.current.startOfDay(for: Date())) }
+                    Divider()
+                    Button("전체…") { confirmClear = true }
+                }
+                .fixedSize()
+            }
+            if filtered.isEmpty {
+                Spacer()
+                Text(query.isEmpty ? "방문 기록이 없어요" : "검색 결과가 없어요").foregroundStyle(.secondary)
+                Spacer()
+            } else {
+                List(filtered) { e in
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(e.title.isEmpty ? strippedURL(e.url) : e.title).lineLimit(1)
+                            Text(strippedURL(e.url)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                        Spacer()
+                        Text(e.date, format: .dateTime.month().day().hour().minute())
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2) { onOpen(e.url, false) }
+                    .contextMenu {
+                        Button("현재 탭에서 열기") { onOpen(e.url, false) }
+                        Button("새 탭에서 열기") { onOpen(e.url, true) }
+                        Button("주소 복사") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(e.url, forType: .string)
+                        }
+                        Divider()
+                        Button("기록에서 삭제") { store.remove(e.id) }
+                    }
+                }
+            }
+            Text("두 번 클릭: 현재 탭에서 열기 · 우클릭: 새 탭에서 열기, 삭제")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .frame(minWidth: 480, minHeight: 440)
+        .alert("방문 기록을 모두 지울까요?", isPresented: $confirmClear) {
+            Button("모두 지우기", role: .destructive) { store.clear(since: nil) }
+            Button("취소", role: .cancel) {}
+        }
+    }
+}
 
 final class FloatingPanel: NSPanel {
     override var canBecomeKey: Bool { true }
@@ -892,7 +1078,7 @@ func muteScript(_ on: Bool) -> WKUserScript {
 // MARK: - 앱
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelegate,
-                         WKNavigationDelegate, WKDownloadDelegate {
+                         WKNavigationDelegate, WKDownloadDelegate, NSTextFieldDelegate {
     let model = SettingsModel(config: ConfigStore.load())
     var config: AppConfig { model.config }
     var applied = AppConfig()
@@ -937,6 +1123,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     var downloadDest: [ObjectIdentifier: URL] = [:]
     var maintenanceTimer: Timer?
     var closedTabs: [(page: PageConfig, index: Int)] = []
+    let history = HistoryStore()
+    var historyWindow: NSWindow?
+    var lastRecorded: [UUID: String] = [:]
+    var lastTypedLength = 0
 
     var hotkeys: [HotKey] = []
     var hotkeysSuspended = false
@@ -957,6 +1147,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
 
         model.onChange = { [weak self] in self?.apply() }
         model.openConfigFile = { NSWorkspace.shared.open(ConfigStore.url) }
+        model.openHistory = { [weak self] in self?.openHistoryWindow() }
         model.reloadConfigFile = { [weak self] in self?.model.config = ConfigStore.load() }
         HotkeyRecorderView.onRecordingChanged = { [weak self] rec in
             self?.hotkeysSuspended = rec
@@ -1102,6 +1293,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         urlField.bezelStyle = .roundedBezel
         urlField.font = .systemFont(ofSize: 12)
         urlField.placeholderString = "주소 또는 검색어 입력 (⌘L)"
+        urlField.delegate = self // 방문 기록 자동완성
         urlField.lineBreakMode = .byTruncatingTail
         urlField.cell?.sendsActionOnEndEditing = false
         urlField.target = self
@@ -1307,6 +1499,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
                 case kVK_ANSI_R: self.reloadCurrent(); return nil
                 case kVK_ANSI_L: self.focusAddressBar(); return nil
                 case kVK_ANSI_T: self.newTab(); return nil
+                case kVK_ANSI_Y: self.openHistoryWindow(); return nil
                 case kVK_ANSI_F: self.showFind(); return nil
                 case kVK_ANSI_G: self.find(backwards: false); return nil
                 case kVK_ANSI_Equal: self.zoomIn(); return nil
@@ -1330,6 +1523,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
                 case kVK_ANSI_M: self.toggleMute(); return nil
                 case kVK_ANSI_P: self.togglePiP(); return nil
                 case kVK_ANSI_T: self.reopenClosedTab(); return nil
+                case kVK_ANSI_N: self.newIncognitoTab(); return nil
                 default: break
                 }
             }
@@ -1482,7 +1676,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             cfg = popupConfig
         } else {
             cfg = WKWebViewConfiguration()
-            cfg.websiteDataStore = .default() // 로그인 유지
+            // 일반 탭은 로그인 유지, 시크릿 탭은 메모리에만 (탭을 닫거나 앱을 끄면 사라짐)
+            cfg.websiteDataStore = page.incognito ? .nonPersistent() : .default()
             cfg.userContentController.addUserScript(muteScript(page.muted))
         }
         cfg.preferences.javaScriptCanOpenWindowsAutomatically = true
@@ -1509,6 +1704,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             wv.observe(\.url, options: [.new]) { [weak self] _, _ in self?.webStateChanged(id) },
             wv.observe(\.canGoBack, options: [.new]) { [weak self] _, _ in self?.webStateChanged(id) },
             wv.observe(\.canGoForward, options: [.new]) { [weak self] _, _ in self?.webStateChanged(id) },
+            wv.observe(\.title, options: [.new]) { [weak self] _, _ in self?.titleChanged(id) },
         ]
         webViews[id] = wv
         webMeta[id] = WebMeta(url: page.url, ua: ua)
@@ -1542,6 +1738,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.followSite(id)
+            self.recordVisit(id)
             guard id == self.currentID else { return }
             self.updateAddressBar(force: false)
         }
@@ -1559,6 +1756,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         p.url = s
         p.name = name
         model.config.pages[i] = p
+    }
+
+    // MARK: 방문 기록 · 시크릿 탭
+
+    func recordVisit(_ id: UUID) {
+        guard config.recordHistory, let wv = webViews[id], let u = wv.url,
+              lastRecorded[id] != u.absoluteString,
+              let p = config.pages.first(where: { $0.id == id }), !p.incognito else { return }
+        lastRecorded[id] = u.absoluteString
+        history.record(url: u, title: wv.title)
+    }
+
+    func titleChanged(_ id: UUID) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.config.recordHistory, let wv = self.webViews[id],
+                  let u = wv.url?.absoluteString, let t = wv.title,
+                  let p = self.config.pages.first(where: { $0.id == id }), !p.incognito else { return }
+            self.history.updateTitle(url: u, title: t)
+        }
+    }
+
+    @objc func newIncognitoTab() {
+        let page = PageConfig(name: "시크릿 탭", url: "https://www.google.com", autoName: true, incognito: true)
+        model.config.pages.append(page)
+        currentID = page.id
+        if panel.isVisible { select(currentIndex, showHUD: false) } else { showPanel() }
+        focusAddressBar()
+    }
+
+    @objc func openHistoryWindow() {
+        if historyWindow == nil {
+            let view = HistoryView(store: history) { [weak self] url, newTab in
+                self?.openFromHistory(url, newTab: newTab)
+            }
+            let w = NSWindow(contentViewController: NSHostingController(rootView: view))
+            w.title = "방문 기록"
+            w.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+            w.isReleasedWhenClosed = false
+            w.setContentSize(NSSize(width: 560, height: 520))
+            w.center()
+            historyWindow = w
+        }
+        historyWindow?.level = panel.level
+        NSApp.activate(ignoringOtherApps: true)
+        historyWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    func openFromHistory(_ s: String, newTab: Bool) {
+        guard let u = URL(string: s) else { return }
+        if newTab || config.pages.isEmpty {
+            let page = PageConfig(name: "새 탭", url: s, autoName: true)
+            model.config.pages.append(page)
+            currentID = page.id
+            showPanel()
+        } else {
+            showPanel()
+            currentWebView?.load(URLRequest(url: u))
+        }
+    }
+
+    // MARK: 주소창 자동완성 (방문 기록에서, Safari처럼 입력 중인 글자 뒤에 회색으로 채움)
+
+    func controlTextDidBeginEditing(_ obj: Notification) {
+        lastTypedLength = 0
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        lastTypedLength = 0
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        guard let field = obj.object as? NSTextField, field === urlField,
+              let editor = field.currentEditor() as? NSTextView else { return }
+        let typed = editor.string
+        let len = (typed as NSString).length
+        defer { lastTypedLength = len }
+        // 지우는 중이거나 공백(검색어)이 있으면 자동완성하지 않음
+        guard len > lastTypedLength, !typed.contains(" "),
+              let i = currentPageIndex, !config.pages[i].incognito,
+              let full = history.complete(typed) else { return }
+        let rest = String(full.dropFirst(typed.count))
+        guard !rest.isEmpty else { return }
+        editor.string = typed + rest
+        editor.setSelectedRange(NSRange(location: len, length: (rest as NSString).length))
     }
 
     @objc func newTab() {
@@ -1763,6 +2044,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         }
         add("영상 PIP (화면 속 화면)   ⌘⇧P", #selector(togglePiP), m)
         add("페이지에서 찾기   ⌘F", #selector(findMenuAction), m)
+        add("방문 기록   ⌘Y", #selector(openHistoryWindow), m)
+        add("새 시크릿 탭   ⌘⇧N", #selector(newIncognitoTab), m)
         m.addItem(.separator())
         let zoomPct = Int(((currentWebView?.pageZoom ?? 1) * 100).rounded())
         let zoomHeader = NSMenuItem(title: "확대 \(zoomPct)%", action: nil, keyEquivalent: "")
@@ -2044,7 +2327,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     func rebuildTabs() {
         tabStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         for (i, p) in config.pages.enumerated() {
-            let b = TabButton(title: "\(i + 1) \(p.name)\(p.muted ? " 🔇" : "")", target: nil, action: nil)
+            let b = TabButton(title: "\(p.incognito ? "🕶 " : "")\(i + 1) \(p.name)\(p.muted ? " 🔇" : "")",
+                              target: nil, action: nil)
             b.owner = self
             b.toolTip = "클릭: 열기 · 좌우로 끌기: 순서 변경 · 우클릭: 닫기"
             let menu = NSMenu()
@@ -2119,6 +2403,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
                                        accessibilityDescription: "음소거")
             muteButton.contentTintColor = p.muted ? .systemRed : nil
             muteButton.toolTip = p.muted ? "음소거 해제 (⌘⇧M)" : "음소거 (⌘⇧M)"
+            // 시크릿 탭은 주소창 막대를 보라색으로
+            addressBar.wantsLayer = true
+            addressBar.layer?.backgroundColor = p.incognito
+                ? NSColor.systemPurple.withAlphaComponent(0.18).cgColor : NSColor.clear.cgColor
+            urlField.placeholderString = p.incognito
+                ? "시크릿 탭 · 기록과 쿠키가 남지 않아요" : "주소 또는 검색어 입력 (⌘L)"
         }
         if force || urlField.currentEditor() == nil {
             if let u = wv?.url?.absoluteString {
@@ -2202,6 +2492,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         blur.state = config.closeOnBlur ? .on : .off
         m.addItem(blur)
         m.addItem(.separator())
+        add("새 시크릿 탭", #selector(newIncognitoTab))
+        add("방문 기록", #selector(openHistoryWindow))
         add("다운로드 폴더 열기", #selector(openDownloads))
         add("설정…", #selector(openSettings))
         m.addItem(.separator())
@@ -2305,6 +2597,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         var page = PageConfig(name: "새 탭", url: s.isEmpty ? "about:blank" : s, autoName: true)
         if let sid = pageID(of: source), let src = config.pages.first(where: { $0.id == sid }) {
             page.device = src.device
+            page.incognito = src.incognito // 시크릿 탭에서 연 링크는 시크릿 탭으로
         }
         return page
     }
