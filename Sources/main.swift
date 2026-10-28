@@ -723,7 +723,7 @@ struct SettingsView: View {
                     Text("아래 (창 맨 아래)").tag(true)
                 }
                 .disabled(!model.config.showAddressBar)
-                Toggle("페이지 전환 시 가운데에 이름 표시", isOn: $model.config.showHUD)
+                Toggle("가운데 알림 표시 (확대 비율, 음소거, 다운로드 등)", isOn: $model.config.showHUD)
                 Toggle("항상 다른 창 위에 표시", isOn: $model.config.alwaysOnTop)
                 Toggle("모든 데스크탑(Spaces)에서 표시", isOn: $model.config.allSpaces)
                 LabeledContent {
@@ -1459,9 +1459,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         updateTabs()
         updateAddressBar(force: true)
         if panel.isVisible && urlField.currentEditor() == nil { panel.makeFirstResponder(wv) }
-        if showHUD && config.showHUD {
-            hud.flash("\(i + 1) / \(n)   \(page.name)", in: container)
-        }
+        _ = showHUD // 탭 전환 시 이름 표시는 하지 않음
     }
 
     func normalizedURL(_ s: String) -> URL? {
