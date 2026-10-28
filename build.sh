@@ -60,6 +60,11 @@ PLIST
 if [[ -n "${VERSION:-}" ]]; then
   /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
 fi
+# 앱 안의 '최신 버전 확인'이 GitHub의 최신 빌드와 비교할 때 쓰는 커밋
+COMMIT="${GITHUB_SHA:-$(git rev-parse HEAD 2>/dev/null || true)}"
+if [[ -n "$COMMIT" ]]; then
+  /usr/libexec/PlistBuddy -c "Add :MCBuildCommit string $COMMIT" "$APP/Contents/Info.plist"
+fi
 
 echo "▸ 서명 중 (ad-hoc)…"
 codesign --force --deep --sign - "$APP"

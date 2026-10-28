@@ -291,6 +291,7 @@ struct AppConfig: Codable, Equatable {
     var unloadMinutes = 0       // 0 = 끔. N분 동안 안 본 탭은 메모리에서 내림
     var pauseOnClose = false    // 창을 닫으면 재생 중인 영상·음악 일시정지
     var recordHistory = true    // 방문 기록 남기기
+    var autoCheckUpdates = true // 시작할 때(이후 하루마다) 새 버전 확인
 
     // 모양
     var opacity: Double = 1.0
@@ -355,6 +356,7 @@ extension AppConfig {
         unloadMinutes = v(.unloadMinutes, unloadMinutes)
         pauseOnClose = v(.pauseOnClose, pauseOnClose)
         recordHistory = v(.recordHistory, recordHistory)
+        autoCheckUpdates = v(.autoCheckUpdates, autoCheckUpdates)
         opacity = v(.opacity, opacity)
         pages = v(.pages, pages)
         version = 2
@@ -571,6 +573,18 @@ final class SettingsModel: ObservableObject {
     @Published var hotkeyErrors: [String] = []
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Published var loginError: String?
+    @Published var updateStatus = ""
+    @Published var updateAvailable = false
+    @Published var updateBusy = false
+    @Published var updateNotes: [String] = []
+    var checkUpdate: (() -> Void)?
+    var installUpdate: (() -> Void)?
+
+    var currentVersion: String {
+        let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let c = (Bundle.main.object(forInfoDictionaryKey: "MCBuildCommit") as? String ?? "")
+        return c.count >= 7 ? "\(v) (\(c.prefix(7)))" : v
+    }
 
     var onChange: (() -> Void)?
     var openConfigFile: (() -> Void)?
@@ -615,6 +629,33 @@ struct SettingsView: View {
     // 일반
     var generalTab: some View {
         Form {
+            Section("업데이트") {
+                LabeledContent("현재 버전", value: model.currentVersion)
+                HStack(spacing: 10) {
+                    Button("최신 버전 확인") { model.checkUpdate?() }
+                        .disabled(model.updateBusy)
+                    if model.updateAvailable {
+                        Button("지금 업데이트") { model.installUpdate?() }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(model.updateBusy)
+                    }
+                    if model.updateBusy { ProgressView().controlSize(.small) }
+                    Spacer()
+                }
+                if !model.updateStatus.isEmpty {
+                    Text(model.updateStatus).font(.caption)
+                        .foregroundStyle(model.updateAvailable ? Color.accentColor : Color.secondary)
+                }
+                if model.updateAvailable && !model.updateNotes.isEmpty {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("바뀐 점").font(.caption).bold()
+                        ForEach(Array(model.updateNotes.prefix(8).enumerated()), id: \.offset) { _, n in
+                            Text("• " + n).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Toggle("시작할 때 자동으로 새 버전 확인", isOn: $model.config.autoCheckUpdates)
+            }
             Section("시작") {
                 Toggle("로그인 시 자동 실행", isOn: Binding(
                     get: { model.launchAtLogin },
@@ -814,6 +855,145 @@ struct SettingsView: View {
 }
 
 // MARK: - 패널 부품
+
+// MARK: - 업데이트 (GitHub Releases의 "latest" 빌드)
+
+final class Updater {
+    let repo = "hyubbb/MenuCycle"
+    weak var model: SettingsModel?
+    var onAvailabilityChanged: ((Bool) -> Void)?
+    private var zipURL: URL?
+
+    var currentSHA: String { Bundle.main.object(forInfoDictionaryKey: "MCBuildCommit") as? String ?? "" }
+
+    private func get(_ path: String, _ done: @escaping ([String: Any]?) -> Void) {
+        guard let u = URL(string: "https://api.github.com/repos/\(repo)/\(path)") else { done(nil); return }
+        var req = URLRequest(url: u)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.timeoutInterval = 20
+        URLSession.shared.dataTask(with: req) { data, resp, _ in
+            guard let data, (resp as? HTTPURLResponse)?.statusCode == 200,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { done(nil); return }
+            done(obj)
+        }.resume()
+    }
+
+    private func setStatus(_ text: String, available: Bool? = nil, busy: Bool = false, notes: [String]? = nil) {
+        DispatchQueue.main.async {
+            guard let m = self.model else { return }
+            m.updateStatus = text
+            m.updateBusy = busy
+            if let notes { m.updateNotes = notes }
+            if let available {
+                m.updateAvailable = available
+                self.onAvailabilityChanged?(available)
+            }
+        }
+    }
+
+    /// manual: 설정에서 버튼을 눌렀을 때 (최신이어도 결과를 보여줌)
+    func check(manual: Bool) {
+        if manual { setStatus("확인 중…", busy: true) }
+        get("releases/tags/latest") { [weak self] rel in
+            guard let self else { return }
+            guard let rel, let latestSHA = rel["target_commitish"] as? String else {
+                if manual { self.setStatus("확인하지 못했어요. 인터넷 연결을 확인하거나 잠시 후 다시 시도해 주세요.") }
+                return
+            }
+            let assets = rel["assets"] as? [[String: Any]] ?? []
+            let zip = assets.first { ($0["name"] as? String) == "MenuCycle-app.zip" }
+            self.zipURL = (zip?["browser_download_url"] as? String).flatMap(URL.init(string:))
+            let name = (rel["name"] as? String) ?? "최신 빌드"
+            let cur = self.currentSHA
+
+            if !cur.isEmpty && latestSHA.hasPrefix(cur) || cur.hasPrefix(latestSHA) && !cur.isEmpty {
+                self.setStatus(manual ? "최신 버전을 쓰고 있어요." : "", available: false)
+                return
+            }
+            guard self.zipURL != nil else {
+                if manual { self.setStatus("새 빌드를 준비 중이에요. 몇 분 뒤에 다시 확인해 주세요.") }
+                return
+            }
+            guard cur.count >= 7 else {
+                // 직접 빌드해서 기준 커밋을 모르는 경우
+                self.setStatus("새 버전: \(name)", available: true, notes: [])
+                return
+            }
+            // 지금 버전과 최신 버전 사이의 변경 내역
+            self.get("compare/\(cur)...\(latestSHA)") { cmp in
+                let status = cmp?["status"] as? String
+                if status == "behind" || status == "identical" {
+                    self.setStatus(manual ? "최신 버전을 쓰고 있어요." : "", available: false)
+                    return
+                }
+                let commits = cmp?["commits"] as? [[String: Any]] ?? []
+                let notes = commits.reversed().compactMap { c -> String? in
+                    let msg = (c["commit"] as? [String: Any])?["message"] as? String
+                    return msg?.components(separatedBy: "\n").first
+                }
+                self.setStatus("새 버전이 있어요: \(name)", available: true, notes: notes)
+            }
+        }
+    }
+
+    /// zip을 받아 풀고, 앱이 꺼지면 교체 후 다시 실행하는 작은 스크립트를 띄운 뒤 앱을 종료
+    func install() {
+        guard let zipURL else { check(manual: true); return }
+        let dest = Bundle.main.bundleURL
+        guard FileManager.default.isWritableFile(atPath: dest.deletingLastPathComponent().path) else {
+            setStatus("\(dest.deletingLastPathComponent().path) 폴더에 쓸 권한이 없어요. 릴리스 페이지에서 DMG로 설치해 주세요.")
+            return
+        }
+        setStatus("내려받는 중…", busy: true)
+        URLSession.shared.downloadTask(with: zipURL) { [weak self] tmp, resp, _ in
+            guard let self else { return }
+            guard let tmp, (resp as? HTTPURLResponse)?.statusCode == 200 else {
+                self.setStatus("내려받지 못했어요. 잠시 후 다시 시도해 주세요.")
+                return
+            }
+            let fm = FileManager.default
+            let work = fm.temporaryDirectory.appendingPathComponent("MenuCycleUpdate-\(UUID().uuidString)")
+            try? fm.createDirectory(at: work, withIntermediateDirectories: true)
+            let zipPath = work.appendingPathComponent("app.zip")
+            do { try fm.moveItem(at: tmp, to: zipPath) } catch {
+                self.setStatus("파일을 저장하지 못했어요.")
+                return
+            }
+            self.setStatus("설치 준비 중…", busy: true)
+            let unzip = Process()
+            unzip.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            unzip.arguments = ["-x", "-k", zipPath.path, work.path]
+            do { try unzip.run(); unzip.waitUntilExit() } catch {}
+            let newApp = work.appendingPathComponent("MenuCycle.app")
+            guard unzip.terminationStatus == 0,
+                  Bundle(url: newApp)?.bundleIdentifier == Bundle.main.bundleIdentifier else {
+                self.setStatus("받은 파일이 올바르지 않아요. 릴리스 페이지에서 DMG로 설치해 주세요.")
+                return
+            }
+            // 앱이 완전히 꺼질 때까지 기다렸다가 교체하고 다시 실행
+            let script = work.appendingPathComponent("swap.sh")
+            let body = """
+            #!/bin/bash
+            while kill -0 "$1" 2>/dev/null; do sleep 0.2; done
+            rm -rf "$3" && mv "$2" "$3" && xattr -cr "$3"
+            open "$3"
+            """
+            do { try body.write(to: script, atomically: true, encoding: .utf8) } catch {
+                self.setStatus("설치 스크립트를 만들지 못했어요.")
+                return
+            }
+            let swap = Process()
+            swap.executableURL = URL(fileURLWithPath: "/bin/bash")
+            swap.arguments = [script.path, String(ProcessInfo.processInfo.processIdentifier), newApp.path, dest.path]
+            do { try swap.run() } catch {
+                self.setStatus("설치를 시작하지 못했어요.")
+                return
+            }
+            self.setStatus("다시 시작하는 중…", busy: true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { NSApp.terminate(nil) }
+        }.resume()
+    }
+}
 
 // MARK: - 방문 기록
 
@@ -1133,6 +1313,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     var maintenanceTimer: Timer?
     var closedTabs: [(page: PageConfig, index: Int)] = []
     let history = HistoryStore()
+    let updater = Updater()
+    var updateTimer: Timer?
     var historyWindow: NSWindow?
     var lastRecorded: [UUID: String] = [:]
     var lastTypedLength = 0
@@ -1158,6 +1340,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         model.onChange = { [weak self] in self?.apply() }
         model.openConfigFile = { NSWorkspace.shared.open(ConfigStore.url) }
         model.openHistory = { [weak self] in self?.openHistoryWindow() }
+        updater.model = model
+        updater.onAvailabilityChanged = { [weak self] available in
+            // 새 버전이 있으면 메뉴바 아이콘에 표시
+            self?.statusItem.button?.image = NSImage(
+                systemSymbolName: available ? "rectangle.stack.badge.plus" : "rectangle.stack",
+                accessibilityDescription: "MenuCycle")
+        }
+        model.checkUpdate = { [weak self] in self?.updater.check(manual: true) }
+        model.installUpdate = { [weak self] in self?.updater.install() }
+        if config.autoCheckUpdates {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.updater.check(manual: false) }
+        }
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 24 * 3600, repeats: true) { [weak self] _ in
+            guard let self, self.config.autoCheckUpdates else { return }
+            self.updater.check(manual: false)
+        }
         model.reloadConfigFile = { [weak self] in self?.model.config = ConfigStore.load() }
         HotkeyRecorderView.onRecordingChanged = { [weak self] rec in
             self?.hotkeysSuspended = rec
@@ -2506,6 +2704,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         blur.state = config.closeOnBlur ? .on : .off
         m.addItem(blur)
         m.addItem(.separator())
+        if model.updateAvailable {
+            add("⬆︎ 새 버전 설치하고 다시 시작", #selector(installUpdateFromMenu))
+            m.addItem(.separator())
+        }
         add("새 시크릿 탭", #selector(newIncognitoTab))
         add("방문 기록", #selector(openHistoryWindow))
         add("다운로드 폴더 열기", #selector(openDownloads))
@@ -2578,6 +2780,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
+
+    @objc func installUpdateFromMenu() { updater.install() }
 
     @objc func toggleAlwaysOnTop() { model.config.alwaysOnTop.toggle() }
     @objc func toggleCloseOnBlur() { model.config.closeOnBlur.toggle() }
