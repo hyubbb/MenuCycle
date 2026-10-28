@@ -1127,6 +1127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     var historyWindow: NSWindow?
     var lastRecorded: [UUID: String] = [:]
     var lastTypedLength = 0
+    var popupOpener: [UUID: UUID?] = [:] // 팝업 탭 → 그 팝업을 연 원래 탭
 
     var hotkeys: [HotKey] = []
     var hotkeysSuspended = false
@@ -2575,7 +2576,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         guard navigationAction.targetFrame == nil else { return nil }
-        switch config.newWindow {
+        // 로그인 팝업은 설정과 관계없이 항상 앱 안의 새 탭으로 연다.
+        // 시스템 브라우저로 보내면 로그인 결과(쿠키·콜백)가 그 브라우저에 남아서 이 앱으로 돌아오지 못하고,
+        // 현재 창에서 열면 원래 페이지(window.opener)와 연결이 끊겨 콜백이 전달되지 않음
+        let u = navigationAction.request.url
+        let blank = u == nil || u?.absoluteString == "" || u?.absoluteString == "about:blank"
+        let sizedPopup = windowFeatures.width != nil || windowFeatures.height != nil
+        let mode: NewWindowBehavior = (isAuthURL(u) || blank || sizedPopup) ? .newTab : config.newWindow
+        switch mode {
         case .defaultBrowser:
             if let u = navigationAction.request.url { NSWorkspace.shared.open(u) }
             return nil
@@ -2586,9 +2594,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             // WebKit이 준 설정으로 웹뷰를 만들어 돌려줘야 로그인 팝업 등이 정상 동작
             let page = newTabPage(url: navigationAction.request.url, from: webView)
             let wv = createWebView(for: page, popupConfig: configuration)
+            popupOpener[page.id] = pageID(of: webView)
             insertTab(page, after: webView, activate: true)
             return wv
         }
+    }
+
+    /// 로그인 화면으로 보이는 주소 (Google, Apple, Microsoft, GitHub, 카카오, 네이버 등)
+    func isAuthURL(_ u: URL?) -> Bool {
+        guard let u, let h = u.host?.lowercased() else { return false }
+        let hosts = ["accounts.google.com", "appleid.apple.com", "login.microsoftonline.com", "login.live.com",
+                     "github.com", "facebook.com", "kauth.kakao.com", "accounts.kakao.com", "nid.naver.com",
+                     "twitter.com", "x.com", "discord.com", "id.atlassian.com", "slack.com", "auth0.com", "okta.com"]
+        if hosts.contains(where: { h == $0 || h.hasSuffix("." + $0) }) { return true }
+        let path = u.path.lowercased()
+        return ["oauth", "authorize", "/sso", "signin", "/login"].contains { path.contains($0) }
     }
 
     /// 링크에서 열리는 새 탭: 원래 탭의 화면 종류를 이어받고, 이름·주소는 사이트를 따라감
@@ -2628,7 +2648,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     func webViewDidClose(_ webView: WKWebView) {
         guard let id = pageID(of: webView), let i = config.pages.firstIndex(where: { $0.id == id }),
               config.pages.count > 1 else { return }
+        let opener = popupOpener.removeValue(forKey: id) ?? nil
         closeTab(at: i)
+        // 로그인이 끝나 팝업이 닫히면 로그인을 시작한 원래 탭으로 돌아감
+        if let opener, config.pages.contains(where: { $0.id == opener }) {
+            currentID = opener
+            if panel.isVisible { select(currentIndex, showHUD: false) }
+        }
     }
 
     func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
