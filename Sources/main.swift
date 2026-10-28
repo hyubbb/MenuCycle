@@ -903,6 +903,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     var deviceButton: NSButton!
     var muteButton: NSButton!
     var moreButton: NSButton!
+    var opacityButton: NSButton!
+    let opacityPopover = NSPopover()
+    let opacitySlider = NSSlider()
+    let opacityLabel = NSTextField(labelWithString: "")
     var plusButton: NSButton!
     let findBar = NSVisualEffectView()
     let findField = NSSearchField()
@@ -1077,7 +1081,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         moreButton = iconButton("ellipsis.circle", "더 보기 (PIP · 확대 · 찾기 · 자동 새로고침 · 다운로드)", #selector(showMoreMenu(_:)))
         deviceButton = iconButton("desktopcomputer", "화면 종류 (PC / iPhone / iPad / Android)", #selector(showDeviceMenu(_:)))
         muteButton = iconButton("speaker.wave.2", "음소거 (⌘⇧M)", #selector(toggleMute))
-        let rightButtons: [NSView] = [muteButton, deviceButton, moreButton, gear]
+        opacityButton = iconButton("circle.lefthalf.filled", "창 투명도", #selector(showOpacity(_:)))
+        setupOpacityPopover()
+        let rightButtons: [NSView] = [muteButton, deviceButton, opacityButton, moreButton, gear]
         for (k, b) in rightButtons.enumerated() {
             b.frame = NSRect(x: w - 34 - CGFloat(rightButtons.count - 1 - k) * 26, y: y, width: bw, height: bh)
             b.autoresizingMask = [.minXMargin]
@@ -1757,6 +1763,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     }
 
     @objc func findMenuAction() { showFind() }
+
+    // MARK: 투명도 (주소창 버튼 → 세로 슬라이더)
+
+    func setupOpacityPopover() {
+        let v = NSView(frame: NSRect(x: 0, y: 0, width: 56, height: 176))
+        opacityLabel.frame = NSRect(x: 0, y: 150, width: 56, height: 16)
+        opacityLabel.alignment = .center
+        opacityLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        opacitySlider.isVertical = true
+        opacitySlider.minValue = 0.3
+        opacitySlider.maxValue = 1.0
+        opacitySlider.isContinuous = true
+        opacitySlider.target = self
+        opacitySlider.action = #selector(opacityChanged(_:))
+        opacitySlider.frame = NSRect(x: 18, y: 10, width: 20, height: 134)
+        v.addSubview(opacityLabel)
+        v.addSubview(opacitySlider)
+        let vc = NSViewController()
+        vc.view = v
+        opacityPopover.contentViewController = vc
+        opacityPopover.contentSize = v.frame.size
+        opacityPopover.behavior = .transient
+    }
+
+    @objc func showOpacity(_ sender: NSButton) {
+        if opacityPopover.isShown { opacityPopover.performClose(nil); return }
+        opacitySlider.doubleValue = config.opacity
+        opacityLabel.stringValue = "\(Int((config.opacity * 100).rounded()))%"
+        opacityPopover.show(relativeTo: sender.bounds, of: sender, preferredEdge: sender.isFlipped ? .maxY : .minY)
+    }
+
+    @objc func opacityChanged(_ sender: NSSlider) {
+        let v = (sender.doubleValue * 100).rounded() / 100
+        opacityLabel.stringValue = "\(Int((v * 100).rounded()))%"
+        if v != config.opacity { model.config.opacity = v }
+    }
 
     @objc func togglePauseOnClose() {
         model.config.pauseOnClose.toggle()
