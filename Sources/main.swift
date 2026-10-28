@@ -267,6 +267,7 @@ struct AppConfig: Codable, Equatable {
     var allSpaces = true
     var showTabBar = true
     var showAddressBar = true
+    var addressBarAtBottom = true // 주소창 섹션을 창 아래쪽에
     var showHUD = true
 
     // 일반
@@ -332,6 +333,7 @@ extension AppConfig {
         allSpaces = v(.allSpaces, allSpaces)
         showTabBar = v(.showTabBar, showTabBar)
         showAddressBar = v(.showAddressBar, showAddressBar)
+        addressBarAtBottom = v(.addressBarAtBottom, addressBarAtBottom)
         showHUD = v(.showHUD, showHUD)
 
         rememberLastPage = v(.rememberLastPage, rememberLastPage)
@@ -716,6 +718,11 @@ struct SettingsView: View {
             Section("표시") {
                 Toggle("페이지 탭 막대 표시", isOn: $model.config.showTabBar)
                 Toggle("주소창 표시", isOn: $model.config.showAddressBar)
+                Picker("주소창 위치", selection: $model.config.addressBarAtBottom) {
+                    Text("위 (탭 아래)").tag(false)
+                    Text("아래 (창 맨 아래)").tag(true)
+                }
+                .disabled(!model.config.showAddressBar)
                 Toggle("페이지 전환 시 가운데에 이름 표시", isOn: $model.config.showHUD)
                 Toggle("항상 다른 창 위에 표시", isOn: $model.config.alwaysOnTop)
                 Toggle("모든 데스크탑(Spaces)에서 표시", isOn: $model.config.allSpaces)
@@ -1129,12 +1136,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             layoutTabBarContents()
         }
         addressBar.isHidden = !config.showAddressBar
+        var bottom: CGFloat = 0
         if config.showAddressBar {
-            top -= addrH
             addressBar.setFrameSize(NSSize(width: b.width, height: addrH))
-            addressBar.setFrameOrigin(NSPoint(x: 0, y: top))
+            if config.addressBarAtBottom {
+                addressBar.setFrameOrigin(NSPoint(x: 0, y: 0))
+                addressBar.autoresizingMask = [.width, .maxYMargin] // 아래에 붙어 있음
+                bottom = addrH
+            } else {
+                top -= addrH
+                addressBar.setFrameOrigin(NSPoint(x: 0, y: top))
+                addressBar.autoresizingMask = [.width, .minYMargin] // 위에 붙어 있음
+            }
         }
-        container.frame = NSRect(x: 0, y: 0, width: b.width, height: top)
+        container.frame = NSRect(x: 0, y: bottom, width: b.width, height: max(0, top - bottom))
     }
 
     /// 탭들은 왼쪽부터 채우고 오른쪽 끝에 + 버튼
@@ -1174,7 +1189,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             panel.setFrame(f, display: true)
         }
 
-        if new.showTabBar != old.showTabBar || new.showAddressBar != old.showAddressBar { layoutChrome() }
+        if new.showTabBar != old.showTabBar || new.showAddressBar != old.showAddressBar
+            || new.addressBarAtBottom != old.addressBarAtBottom { layoutChrome() }
         if new.opacity != old.opacity { panel.alphaValue = CGFloat(new.opacity) }
 
         if new.pages != old.pages {
@@ -1567,7 +1583,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     // MARK: 화면 종류 (PC / iPhone / iPad / Android / 직접 입력)
 
     func popUp(_ menu: NSMenu, under sender: NSView) {
-        let p = NSPoint(x: 0, y: sender.isFlipped ? sender.bounds.height + 2 : -2)
+        // 메뉴의 왼쪽 위 모서리를 p에 맞춤. 주소창이 아래에 있으면 버튼 위로 펼침
+        let h = menu.size.height
+        let p: NSPoint
+        if config.addressBarAtBottom {
+            p = NSPoint(x: 0, y: sender.isFlipped ? -2 - h : sender.bounds.height + 2 + h)
+        } else {
+            p = NSPoint(x: 0, y: sender.isFlipped ? sender.bounds.height + 2 : -2)
+        }
         menu.popUp(positioning: nil, at: p, in: sender)
     }
 
@@ -1803,7 +1826,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         if opacityPopover.isShown { opacityPopover.performClose(nil); return }
         opacitySlider.doubleValue = config.opacity
         opacityLabel.stringValue = "\(Int((config.opacity * 100).rounded()))%"
-        opacityPopover.show(relativeTo: sender.bounds, of: sender, preferredEdge: sender.isFlipped ? .maxY : .minY)
+        // 주소창이 아래에 있으면 버튼 위쪽으로, 위에 있으면 아래쪽으로 띄움
+        let below: NSRectEdge = sender.isFlipped ? .maxY : .minY
+        let above: NSRectEdge = sender.isFlipped ? .minY : .maxY
+        opacityPopover.show(relativeTo: sender.bounds, of: sender,
+                            preferredEdge: config.addressBarAtBottom ? above : below)
     }
 
     @objc func opacityChanged(_ sender: NSSlider) {
