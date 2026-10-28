@@ -2502,7 +2502,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             decisionHandler(.cancel)
             return
         }
-        decisionHandler(navigationAction.shouldPerformDownload ? .download : .allow)
+        if navigationAction.shouldPerformDownload {
+            decisionHandler(.download)
+            return
+        }
+        // 그냥 .allow 를 주면 WebKit이 링크를 클릭할 때 '이 주소를 맡은 앱'(유튜브 웹 앱 등)이 있는지 확인해서
+        // 그 앱으로 넘겨버림. 앱으로 넘기지 말고 이 창 안에서 열도록 하는 값 (allow + 2 = AllowWithoutTryingAppLink)
+        let allowInPlace = WKNavigationActionPolicy(rawValue: WKNavigationActionPolicy.allow.rawValue + 2) ?? .allow
+        decisionHandler(allowInPlace)
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
