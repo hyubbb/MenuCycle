@@ -161,15 +161,8 @@ enum CmdWAction: String, Codable, CaseIterable, Identifiable {
 }
 
 enum NewWindowBehavior: String, Codable, CaseIterable, Identifiable {
-    case newTab, sameView, defaultBrowser
+    case newTab, sameView // (더 이상 설정에서 고르지 않음. 새 창 링크는 항상 새 탭)
     var id: String { rawValue }
-    var title: String {
-        switch self {
-        case .newTab: return "새 탭으로 열기"
-        case .sameView: return "현재 창에서 열기"
-        case .defaultBrowser: return "기본 브라우저에서 열기"
-        }
-    }
 }
 
 let desktopUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
@@ -671,9 +664,8 @@ struct SettingsView: View {
                 Picker("주소창 검색 엔진", selection: $model.config.searchEngine) {
                     ForEach(SearchEngine.allCases) { Text($0.title).tag($0) }
                 }
-                Picker("새 창으로 열리는 링크", selection: $model.config.newWindow) {
-                    ForEach(NewWindowBehavior.allCases) { Text($0.title).tag($0) }
-                }
+                Text("새 창으로 열리는 링크는 앱 안 새 탭으로 열립니다. 시스템 브라우저로 열려면 링크를 ⌥(Option)+클릭하거나 우클릭 → '기본 브라우저에서 열기'.")
+                    .font(.caption).foregroundStyle(.secondary)
                 LabeledContent("직접 입력 User-Agent") {
                     TextField("화면 종류를 '직접 입력'으로 고른 탭에 사용", text: $model.config.customUserAgent)
                         .frame(width: 300)
@@ -1266,6 +1258,51 @@ func muteScript(_ on: Bool) -> WKUserScript {
     })();
     """
     return WKUserScript(source: src, injectionTime: .atDocumentEnd, forMainFrameOnly: false)
+}
+
+/// 우클릭한 위치의 링크 주소를 앱에 알려줌 (우클릭 메뉴에 '기본 브라우저에서 열기'를 넣기 위해)
+let contextLinkScript = WKUserScript(source: """
+document.addEventListener('contextmenu', function(e){
+  var a = (e.target && e.target.closest) ? e.target.closest('a[href]') : null;
+  try { window.webkit.messageHandlers.mcContextLink.postMessage(a ? a.href : ''); } catch (_) {}
+}, true);
+""", injectionTime: .atDocumentStart, forMainFrameOnly: false)
+
+final class ContextLinkHandler: NSObject, WKScriptMessageHandler {
+    func userContentController(_ ucc: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard let wv = message.webView as? MCWebView else { return }
+        let s = message.body as? String ?? ""
+        wv.contextLink = s.isEmpty ? nil : URL(string: s)
+    }
+}
+let contextLinkHandler = ContextLinkHandler()
+
+/// 링크 우클릭 메뉴에 '기본 브라우저에서 열기' 추가, '새 윈도우에서 열기'는 '새 탭에서 열기'로 이름 변경
+final class MCWebView: WKWebView {
+    var contextLink: URL?
+
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        super.willOpenMenu(menu, with: event)
+        guard let link = contextLink, link.scheme == "http" || link.scheme == "https" else { return }
+        guard let i = menu.items.firstIndex(where: {
+            ($0.identifier?.rawValue ?? "") == "WKMenuItemIdentifierOpenLinkInNewWindow"
+        }) else { return }
+        let openItem = menu.items[i]
+        openItem.title = "새 탭에서 링크 열기"
+        let item = NSMenuItem(title: "기본 브라우저에서 열기", action: #selector(openInDefaultBrowser(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = link
+        menu.insertItem(item, at: i + 1)
+    }
+
+    override func didCloseMenu(_ menu: NSMenu, with event: NSEvent?) {
+        super.didCloseMenu(menu, with: event)
+        contextLink = nil
+    }
+
+    @objc func openInDefaultBrowser(_ sender: NSMenuItem) {
+        if let u = sender.representedObject as? URL { NSWorkspace.shared.open(u) }
+    }
 }
 
 // MARK: - 앱
@@ -1895,7 +1932,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         }
         cfg.preferences.javaScriptCanOpenWindowsAutomatically = true
         cfg.preferences.isElementFullscreenEnabled = true // 영상 전체화면 버튼
-        let wv = WKWebView(frame: container.bounds, configuration: cfg)
+        if popupConfig == nil {
+            // 우클릭한 링크 주소를 받는 통로 (팝업은 원래 탭과 같은 통로를 공유하므로 한 번만 등록)
+            cfg.userContentController.add(contextLinkHandler, name: "mcContextLink")
+            cfg.userContentController.addUserScript(contextLinkScript)
+        }
+        let wv = MCWebView(frame: container.bounds, configuration: cfg)
         wv.autoresizingMask = [.width, .height]
         wv.allowsBackForwardNavigationGestures = true
         wv.allowsMagnification = true
@@ -2129,6 +2171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             let ucc = wv.configuration.userContentController
             ucc.removeAllUserScripts()
             ucc.addUserScript(muteScript(on)) // 다음에 불러오는 페이지에도 적용
+            ucc.addUserScript(contextLinkScript)
             wv.evaluateJavaScript("window.__mcSetMuted && window.__mcSetMuted(\(on ? "true" : "false"))",
                                   completionHandler: nil)
         }
@@ -2443,6 +2486,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        // ⌥(Option)+클릭한 링크는 시스템 기본 브라우저로
+        if navigationAction.navigationType == .linkActivated,
+           navigationAction.modifierFlags.contains(.option),
+           let u = navigationAction.request.url, u.scheme == "http" || u.scheme == "https" {
+            NSWorkspace.shared.open(u)
+            decisionHandler(.cancel)
+            return
+        }
         // ⌘+클릭한 링크는 브라우저처럼 뒤쪽 새 탭으로 (현재 탭은 그대로)
         if navigationAction.navigationType == .linkActivated,
            navigationAction.modifierFlags.contains(.command),
@@ -2800,28 +2851,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         guard navigationAction.targetFrame == nil else { return nil }
-        // 로그인 팝업은 설정과 관계없이 항상 앱 안의 새 탭으로 연다.
-        // 시스템 브라우저로 보내면 로그인 결과(쿠키·콜백)가 그 브라우저에 남아서 이 앱으로 돌아오지 못하고,
-        // 현재 창에서 열면 원래 페이지(window.opener)와 연결이 끊겨 콜백이 전달되지 않음
-        let u = navigationAction.request.url
-        let blank = u == nil || u?.absoluteString == "" || u?.absoluteString == "about:blank"
-        let sizedPopup = windowFeatures.width != nil || windowFeatures.height != nil
-        let mode: NewWindowBehavior = (isAuthURL(u) || blank || sizedPopup) ? .newTab : config.newWindow
-        switch mode {
-        case .defaultBrowser:
-            if let u = navigationAction.request.url { NSWorkspace.shared.open(u) }
-            return nil
-        case .sameView:
-            webView.load(navigationAction.request)
-            return nil
-        case .newTab:
-            // WebKit이 준 설정으로 웹뷰를 만들어 돌려줘야 로그인 팝업 등이 정상 동작
-            let page = newTabPage(url: navigationAction.request.url, from: webView)
-            let wv = createWebView(for: page, popupConfig: configuration)
-            popupOpener[page.id] = pageID(of: webView)
-            insertTab(page, after: webView, activate: true)
-            return wv
-        }
+        // 새 창으로 열리는 링크(구글 검색 결과, 우클릭 → 새 창, 로그인 팝업 등)는 경로와 관계없이 항상 앱 안 새 탭.
+        // WebKit이 준 설정으로 웹뷰를 만들어 돌려줘야 원래 페이지(window.opener)와 연결이 유지되어 로그인 콜백이 동작함.
+        // 시스템 브라우저는 ⌥+클릭 / 우클릭 메뉴로 사용자가 직접 고를 때만 사용
+        let page = newTabPage(url: navigationAction.request.url, from: webView)
+        let wv = createWebView(for: page, popupConfig: configuration)
+        popupOpener[page.id] = pageID(of: webView)
+        insertTab(page, after: webView, activate: true)
+        return wv
     }
 
     /// 로그인 화면으로 보이는 주소 (Google, Apple, Microsoft, GitHub, 카카오, 네이버 등)
