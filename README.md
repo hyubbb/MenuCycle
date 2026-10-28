@@ -16,7 +16,18 @@
 - macOS 13 (Ventura) 이상
 - Xcode Command Line Tools (`xcode-select --install`)
 
-## 설치
+## 다운로드 (빌드 없이 바로 설치)
+
+[**Releases → 최신 빌드**](https://github.com/hyubbb/MenuCycle/releases/latest)에서 `MenuCycle.dmg`를 받아 열고, MenuCycle을 **Applications** 폴더로 끌어다 놓으세요.
+macOS 13 이상이면 Apple Silicon과 Intel Mac 모두에서 동작합니다.
+
+처음 열 때 **"확인되지 않은 개발자"** 경고가 뜨면 다음 중 하나를 하세요.
+- 시스템 설정 → 개인정보 보호 및 보안 → 아래쪽 **그래도 열기**
+- 터미널에서 `xattr -cr /Applications/MenuCycle.app` 실행 후 다시 열기
+
+> `main`에 코드가 올라올 때마다 GitHub Actions가 앱을 빌드해서 최신 빌드를 자동으로 바꿉니다. 버전을 고정해 배포하려면 `git tag v1.0 && git push origin v1.0`처럼 태그를 올리세요.
+
+## 소스에서 빌드해 설치
 
 ```bash
 git clone https://github.com/hyubbb/MenuCycle.git
@@ -152,8 +163,9 @@ defaults delete local.menucycle.app 2>/dev/null
 ```
 MenuCycle/
 ├── Sources/main.swift   # 앱 전체 (AppKit + SwiftUI 설정 창 + WebKit)
-├── build.sh             # swiftc로 빌드 → .app 번들 생성 → ad-hoc 서명 (install 시 설치·실행)
-├── 업데이트.command      # 다운로드 폴더의 최신 zip을 찾아 build.sh install 실행
+├── build.sh             # swiftc로 빌드 → .app 번들 생성 → ad-hoc 서명 (install 시 설치·실행, UNIVERSAL=1이면 Intel+Apple Silicon)
+├── 업데이트.command      # 더블클릭하면 build.sh install 실행
+├── .github/workflows/release.yml  # 푸시할 때마다 앱 빌드 → Releases에 DMG 업로드
 └── README.md
 ```
 

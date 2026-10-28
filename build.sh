@@ -16,11 +16,25 @@ fi
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-echo "▸ 컴파일 중 ($ARCH)…"
-swiftc -O -swift-version 5 \
-  -target "${ARCH}-apple-macos13.0" \
-  -framework Cocoa -framework SwiftUI -framework WebKit -framework Carbon -framework ServiceManagement \
-  Sources/main.swift -o "$APP/Contents/MacOS/MenuCycle"
+compile() { # $1 = arm64 | x86_64, $2 = 출력 파일
+  swiftc -O -swift-version 5 \
+    -target "$1-apple-macos13.0" \
+    -framework Cocoa -framework SwiftUI -framework WebKit -framework Carbon -framework ServiceManagement \
+    Sources/main.swift -o "$2"
+}
+
+if [[ "${UNIVERSAL:-0}" == "1" ]]; then
+  # 배포용: Apple Silicon + Intel 둘 다 들어간 파일 (GitHub Actions에서 사용)
+  echo "▸ 컴파일 중 (arm64 + x86_64)…"
+  mkdir -p build/tmp
+  compile arm64 build/tmp/MenuCycle-arm64
+  compile x86_64 build/tmp/MenuCycle-x86_64
+  lipo -create build/tmp/MenuCycle-arm64 build/tmp/MenuCycle-x86_64 -output "$APP/Contents/MacOS/MenuCycle"
+  rm -rf build/tmp
+else
+  echo "▸ 컴파일 중 ($ARCH)…"
+  compile "$ARCH" "$APP/Contents/MacOS/MenuCycle"
+fi
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -42,6 +56,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+
+if [[ -n "${VERSION:-}" ]]; then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+fi
 
 echo "▸ 서명 중 (ad-hoc)…"
 codesign --force --deep --sign - "$APP"
