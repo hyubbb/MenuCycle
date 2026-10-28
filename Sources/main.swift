@@ -122,6 +122,15 @@ enum SearchEngine: String, Codable, CaseIterable, Identifiable {
         case .duckduckgo: return "DuckDuckGo"
         }
     }
+    /// 검색 엔진 첫 화면 (+로 만든 탭의 홈)
+    var homeURL: String {
+        switch self {
+        case .google: return "https://www.google.com"
+        case .naver: return "https://www.naver.com"
+        case .duckduckgo: return "https://duckduckgo.com"
+        }
+    }
+
     func searchURL(_ q: String) -> URL? {
         var c: URLComponents?
         switch self {
@@ -1270,7 +1279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         backButton = iconButton("chevron.left", "뒤로 (⌘[)", #selector(goBack))
         forwardButton = iconButton("chevron.right", "앞으로 (⌘])", #selector(goForward))
         let reload = iconButton("arrow.clockwise", "새로고침 (⌘R)", #selector(reloadCurrent))
-        let home = iconButton("house", "이 페이지의 기본 주소로", #selector(goHome))
+        let home = iconButton("house", "홈 (등록한 주소 / 새 탭은 검색 엔진 첫 화면)", #selector(goHome))
         let gear = iconButton("gearshape", "설정 (⌘,)", #selector(openSettings))
 
         let bw: CGFloat = 24, y: CGFloat = 4, bh: CGFloat = 24
@@ -2445,9 +2454,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     @objc func goForward() { currentWebView?.goForward() }
     @objc func reloadCurrent() { currentWebView?.reload() }
 
+    /// 홈: 설정에서 등록한 탭은 등록한 주소로,
+    /// +로 만든 탭(주소가 보는 사이트를 따라가는 탭)은 검색 엔진 첫 화면으로
     @objc func goHome() {
-        guard config.pages.indices.contains(currentIndex),
-              let u = normalizedURL(config.pages[currentIndex].url) else { return }
+        guard let i = currentPageIndex else { return }
+        let p = config.pages[i]
+        let home = p.autoName ? config.searchEngine.homeURL : p.url
+        guard let u = normalizedURL(home) else { return }
         currentWebView?.load(URLRequest(url: u))
     }
 
