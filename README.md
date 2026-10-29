@@ -9,7 +9,7 @@
 | 언어 | Swift 5 | 앱 전체 (단일 파일, Xcode 프로젝트 없이 `swiftc`로 빌드) |
 | UI | AppKit — `NSStatusItem`, `NSPanel`, `NSStackView`, `NSPopover`, `NSMenu` | 메뉴바 아이콘, 떠 있는 창, 탭 막대(드래그 정렬), 투명도 슬라이더, 우클릭 메뉴 |
 | UI | SwiftUI — `ObservableObject`, `Form`, `TabView`, `List`, `NSViewRepresentable` | 설정 창, 방문 기록 창, 단축키 입력 칸 |
-| 웹 | WebKit — `WKWebView`, `WKNavigationDelegate`, `WKUIDelegate`, `WKDownload`, `WKUserScript`, `WKScriptMessageHandler`, `WKWebsiteDataStore` | 탭별 웹페이지, 새 창·로그인 팝업 처리, 다운로드, 음소거·우클릭 링크 스크립트, 시크릿 탭(비영구 저장소) |
+| 웹 | WebKit — `WKWebView`, `WKNavigationDelegate`, `WKUIDelegate`, `WKDownload`, `WKUserScript`, `WKScriptMessageHandler`, `WKURLSchemeHandler`, `WKWebsiteDataStore` | 탭별 웹페이지, 새 창·로그인 팝업 처리, 다운로드, 음소거·우클릭 링크 스크립트, 커스텀 스킴(`menucycle://`) 시작 페이지, 시크릿 탭(비영구 저장소) |
 | 시스템 | Carbon `RegisterEventHotKey` | 손쉬운 사용 권한 없이 동작하는 전역 단축키 |
 | 시스템 | ServiceManagement `SMAppService` | 로그인 시 자동 실행 |
 | 시스템 | Foundation — `URLSession`, `Codable`, KVO, `Process` | GitHub API로 업데이트 확인·다운로드·자체 교체, 설정·기록 JSON 저장 |
@@ -108,14 +108,14 @@ bash build.sh install
 
 | 버튼 | 기능 |
 |---|---|
-| ⌂ | 홈: 설정에서 등록한 탭은 등록한 주소로, `+`로 만든 탭은 검색 엔진 첫 화면으로 |
+| ⌂ | 홈: 설정에서 등록한 탭은 등록한 주소로, `+`로 만든 탭은 시작 페이지로 |
 | 🔊 | 현재 탭 음소거 |
 | 🖥 | 화면 종류: PC / iPhone / iPad / Android / 직접 입력한 User-Agent |
 | ◐ | 창 투명도 (세로 슬라이더, 30~100%) |
 | ⋯ | PIP, 찾기, 방문 기록, 새 시크릿 탭, 확대/축소, 자동 새로고침, 창 닫을 때 일시정지, 다운로드 폴더 |
 | ⚙ | 설정 |
 
-`+`로 만든 탭은 Google로 열리며, 탭 이름과 주소가 보고 있는 사이트를 따라갑니다. 다음에 앱을 켜도 마지막으로 보던 사이트로 열립니다.
+`+`로 만든 탭은 **시작 페이지**로 열립니다. 검색창과 자주 가는 사이트 바로가기(네이버, Google, Instagram, YouTube, YouTube Music, Spotify, ChatGPT, Claude, Gemini)가 있고, 바로가기는 설정 → 새 탭에서 추가·삭제·순서 변경할 수 있습니다. 탭 이름과 주소는 보고 있는 사이트를 따라갑니다. 다음에 앱을 켜도 마지막으로 보던 사이트로 열립니다.
 
 ---
 
@@ -165,6 +165,7 @@ bash build.sh install
 | 단축키·닫기 | 단축키 녹화, 열기/닫기 같은 키 사용 여부, `⌘W` 동작, 닫는 방법 |
 | 창 | 위치, 크기, 탭 막대·탭 이름·주소창 표시, 주소창 위치(위/아래), 가운데 알림 표시, 항상 위, 모든 데스크탑, 투명도 |
 | 페이지 | 탭 추가·삭제·이름·주소·화면 종류·자동 새로고침, 드래그로 순서 변경 |
+| 새 탭 | 시작 페이지 바로가기 추가·삭제·순서 변경, 기본 목록으로 되돌리기 |
 
 설정은 `~/Library/Application Support/MenuCycle/config.json`에 저장되며, 직접 고친 뒤 설정 → 일반 → **설정 파일 다시 불러오기**로 반영할 수 있습니다.
 

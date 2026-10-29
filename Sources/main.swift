@@ -214,6 +214,24 @@ enum DeviceMode: String, Codable, CaseIterable, Identifiable {
 
 let refreshChoices = [0, 1, 5, 10, 30, 60]
 
+/// 새 탭 시작 페이지의 바로가기
+struct QuickLink: Codable, Identifiable, Equatable {
+    var id = UUID()
+    var name: String
+    var url: String
+}
+
+extension QuickLink {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? c.decodeIfPresent(UUID.self, forKey: .id)) ?? UUID()
+        name = (try? c.decodeIfPresent(String.self, forKey: .name)) ?? ""
+        url = (try? c.decodeIfPresent(String.self, forKey: .url)) ?? ""
+    }
+}
+
+let startPageURL = "menucycle://newtab"
+
 struct PageConfig: Codable, Identifiable, Equatable {
     var id = UUID()
     var name: String
@@ -278,6 +296,7 @@ struct AppConfig: Codable, Equatable {
     // 일반
     var rememberLastPage = true
     var searchEngine: SearchEngine = .google
+    var quickLinks: [QuickLink] = AppConfig.defaultQuickLinks
     var newWindow: NewWindowBehavior = .newTab
     var customUserAgent = ""
 
@@ -292,8 +311,20 @@ struct AppConfig: Codable, Equatable {
 
     var pages: [PageConfig] = [AppConfig.googlePage()]
 
+    static let defaultQuickLinks: [QuickLink] = [
+        QuickLink(name: "네이버", url: "https://www.naver.com"),
+        QuickLink(name: "Google", url: "https://www.google.com"),
+        QuickLink(name: "Instagram", url: "https://www.instagram.com"),
+        QuickLink(name: "YouTube", url: "https://www.youtube.com"),
+        QuickLink(name: "YouTube Music", url: "https://music.youtube.com"),
+        QuickLink(name: "Spotify", url: "https://open.spotify.com"),
+        QuickLink(name: "ChatGPT", url: "https://chatgpt.com"),
+        QuickLink(name: "Claude", url: "https://claude.ai"),
+        QuickLink(name: "Gemini", url: "https://gemini.google.com"),
+    ]
+
     static func googlePage() -> PageConfig {
-        PageConfig(name: "Google", url: "https://www.google.com", autoName: true)
+        PageConfig(name: "새 탭", url: startPageURL, autoName: true)
     }
 }
 
@@ -346,6 +377,7 @@ extension AppConfig {
 
         rememberLastPage = v(.rememberLastPage, rememberLastPage)
         searchEngine = v(.searchEngine, searchEngine)
+        quickLinks = v(.quickLinks, quickLinks)
         newWindow = v(.newWindow, newWindow)
         customUserAgent = v(.customUserAgent, customUserAgent)
         unloadMinutes = v(.unloadMinutes, unloadMinutes)
@@ -616,6 +648,7 @@ struct SettingsView: View {
             keysTab.tabItem { Label("단축키·닫기", systemImage: "keyboard") }
             windowTab.tabItem { Label("창", systemImage: "macwindow") }
             pagesTab.tabItem { Label("페이지", systemImage: "list.bullet") }
+            quickLinksTab.tabItem { Label("새 탭", systemImage: "square.grid.3x3") }
         }
         .padding(12)
         .frame(width: 700, height: 620)
@@ -801,6 +834,40 @@ struct SettingsView: View {
     }
 
     // 페이지
+    // 새 탭 바로가기
+    var quickLinksTab: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("+ 버튼(⌘T)으로 새 탭을 열면 보이는 시작 페이지의 바로가기예요.")
+                .font(.caption).foregroundStyle(.secondary)
+            List {
+                ForEach($model.config.quickLinks) { $link in
+                    HStack(spacing: 8) {
+                        Image(systemName: "line.3.horizontal").foregroundStyle(.tertiary)
+                        TextField("이름", text: $link.name).frame(width: 130)
+                        TextField("https://", text: $link.url)
+                        Button {
+                            model.config.quickLinks.removeAll { $0.id == link.id }
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                    .padding(.vertical, 2)
+                }
+                .onMove { from, to in model.config.quickLinks.move(fromOffsets: from, toOffset: to) }
+            }
+            HStack {
+                Button {
+                    model.config.quickLinks.append(QuickLink(name: "새 바로가기", url: "https://"))
+                } label: {
+                    Label("바로가기 추가", systemImage: "plus")
+                }
+                Spacer()
+                Button("기본 목록으로 되돌리기") { model.config.quickLinks = AppConfig.defaultQuickLinks }
+            }
+        }
+    }
+
     var pagesTab: some View {
         VStack(alignment: .leading, spacing: 10) {
             List {
@@ -1291,6 +1358,118 @@ func menuBarIcon(badge: Bool) -> NSImage {
     return img
 }
 
+// MARK: - 새 탭 시작 페이지 (menucycle://newtab)
+
+final class StartPageHandler: NSObject, WKURLSchemeHandler {
+    var html: () -> String = { "" }
+
+    func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
+        let data = Data(html().utf8)
+        let url = task.request.url ?? URL(string: startPageURL)!
+        task.didReceive(URLResponse(url: url, mimeType: "text/html", expectedContentLength: data.count,
+                                    textEncodingName: "utf-8"))
+        task.didReceive(data)
+        task.didFinish()
+    }
+
+    func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {}
+}
+let startPageHandler = StartPageHandler()
+
+func htmlEscape(_ s: String) -> String {
+    s.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;")
+        .replacingOccurrences(of: ">", with: "&gt;").replacingOccurrences(of: "\"", with: "&quot;")
+        .replacingOccurrences(of: "'", with: "&#39;")
+}
+
+/// 잘 알려진 사이트는 브랜드 색 아이콘, 나머지는 첫 글자 아이콘
+func quickLinkIcon(_ link: QuickLink) -> String {
+    let host = (URL(string: link.url.contains("://") ? link.url : "https://" + link.url)?.host ?? "").lowercased()
+    func box(_ bg: String, _ inner: String) -> String {
+        "<svg viewBox='0 0 64 64'><rect width='64' height='64' rx='16' fill='\(bg)'/>\(inner)</svg>"
+    }
+    if host.contains("music.youtube") {
+        return box("#ff0033", "<circle cx='32' cy='32' r='17' fill='none' stroke='#fff' stroke-width='3.5'/><path d='M28 24.5v15l12-7.5z' fill='#fff'/>")
+    }
+    if host.contains("youtube") {
+        return box("#ff0033", "<rect x='13' y='19' width='38' height='26' rx='8' fill='#fff'/><path d='M28 25.5v13l11-6.5z' fill='#ff0033'/>")
+    }
+    if host.contains("naver") {
+        return box("#03c75a", "<path d='M19 18h9.5l7.5 11.5V18H45v28h-9.5L28 34.5V46H19z' fill='#fff'/>")
+    }
+    if host.contains("gemini") {
+        return box("#ffffff", "<defs><linearGradient id='gm' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='#4285f4'/><stop offset='1' stop-color='#a142f4'/></linearGradient></defs><path d='M32 10c1.6 11.4 10.6 20.4 22 22-11.4 1.6-20.4 10.6-22 22-1.6-11.4-10.6-20.4-22-22 11.4-1.6 20.4-10.6 22-22z' fill='url(#gm)'/>")
+    }
+    if host.contains("google") {
+        return box("#ffffff", "<text x='32' y='44' text-anchor='middle' font-family='-apple-system,Helvetica,Arial' font-weight='700' font-size='34' fill='#4285f4'>G</text>")
+    }
+    if host.contains("instagram") {
+        return "<svg viewBox='0 0 64 64'><defs><linearGradient id='ig' x1='0' y1='1' x2='1' y2='0'><stop offset='0' stop-color='#feda75'/><stop offset='.35' stop-color='#fa7e1e'/><stop offset='.65' stop-color='#d62976'/><stop offset='1' stop-color='#4f5bd5'/></linearGradient></defs><rect width='64' height='64' rx='16' fill='url(#ig)'/><rect x='16' y='16' width='32' height='32' rx='10' fill='none' stroke='#fff' stroke-width='3.5'/><circle cx='32' cy='32' r='7.5' fill='none' stroke='#fff' stroke-width='3.5'/><circle cx='41.5' cy='22.5' r='2.2' fill='#fff'/></svg>"
+    }
+    if host.contains("spotify") {
+        return box("#1db954", "<path d='M18 25c9-3 20-2.5 28 2M20 32.5c7.5-2.3 16.5-1.8 23 1.8M22 39.5c6-1.7 12.5-1.3 18 1.4' fill='none' stroke='#000' stroke-width='3.6' stroke-linecap='round'/>")
+    }
+    if host.contains("chatgpt") || host.contains("openai") {
+        return box("#000000", "<text x='32' y='40' text-anchor='middle' font-family='-apple-system,Helvetica,Arial' font-weight='700' font-size='20' fill='#fff'>GPT</text>")
+    }
+    if host.contains("claude") {
+        return box("#d97757", "<g stroke='#fff' stroke-width='4' stroke-linecap='round'><path d='M32 16v32M16 32h32M20.7 20.7l22.6 22.6M43.3 20.7L20.7 43.3'/></g>")
+    }
+    let letter = htmlEscape(String(link.name.prefix(1)).uppercased())
+    let colors = ["#5b8def", "#e5677d", "#f0a63c", "#4fb98a", "#9a6cf0", "#38a9c9"]
+    let seed = host.unicodeScalars.reduce(0) { $0 + Int($1.value) } // 실행할 때마다 색이 바뀌지 않게
+    let bg = colors[seed % colors.count]
+    return box(bg, "<text x='32' y='42' text-anchor='middle' font-family='-apple-system,Helvetica,Arial' font-weight='700' font-size='28' fill='#fff'>\(letter)</text>")
+}
+
+func startPageHTML(links: [QuickLink], engine: SearchEngine) -> String {
+    let tiles = links.map { l -> String in
+        let href = l.url.contains("://") ? l.url : "https://" + l.url
+        return "<a class='tile' href='\(htmlEscape(href))'><div class='ic'>\(quickLinkIcon(l))</div><div class='nm'>\(htmlEscape(l.name))</div></a>"
+    }.joined()
+    let tpl = engine.searchURL("__Q__")?.absoluteString ?? "https://www.google.com/search?q=__Q__"
+    return """
+    <!doctype html><html lang="ko"><head><meta charset="utf-8"><title>새 탭</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>
+    :root{--bg:#f5f5f7;--fg:#1d1d1f;--sub:#6e6e73;--card:#ffffff;--line:#d2d2d7}
+    @media (prefers-color-scheme:dark){:root{--bg:#1c1c1e;--fg:#f5f5f7;--sub:#a1a1a6;--card:#2c2c2e;--line:#3a3a3c}}
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh;background:var(--bg);color:var(--fg);font-family:-apple-system,"Apple SD Gothic Neo",sans-serif;
+         display:flex;flex-direction:column;align-items:center;padding:12vh 20px 40px}
+    form{width:100%;max-width:520px;margin-bottom:36px}
+    input{width:100%;height:46px;border-radius:23px;border:1px solid var(--line);background:var(--card);color:var(--fg);
+          padding:0 20px;font-size:15px;outline:none}
+    input:focus{border-color:#0a84ff;box-shadow:0 0 0 3px rgba(10,132,255,.25)}
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:18px 10px;width:100%;max-width:560px}
+    .tile{display:flex;flex-direction:column;align-items:center;gap:8px;text-decoration:none;color:var(--fg);padding:8px 4px;border-radius:14px}
+    .tile:hover{background:rgba(127,127,127,.12)}
+    .ic{width:52px;height:52px;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.15)}
+    .ic svg{width:100%;height:100%;display:block}
+    .nm{font-size:12px;color:var(--sub);max-width:84px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .empty{color:var(--sub);font-size:13px}
+    </style></head><body>
+    <form id="f"><input id="q" placeholder="검색어 또는 주소 입력" autocomplete="off"></form>
+    <div class="grid">\(tiles.isEmpty ? "<div class='empty'>설정 → 새 탭에서 바로가기를 추가하세요</div>" : tiles)</div>
+    <script>
+    document.getElementById('f').addEventListener('submit', function(e){
+      e.preventDefault();
+      var q = document.getElementById('q').value.trim();
+      if (!q) return;
+      if (/^[a-z]+:\\/\\//i.test(q)) { location.href = q; return; }
+      if (q.indexOf(' ') < 0 && q.indexOf('.') > 0) { location.href = 'https://' + q; return; }
+      location.href = \(jsString(tpl)).replace('__Q__', encodeURIComponent(q));
+    });
+    </script></body></html>
+    """
+}
+
+func jsString(_ s: String) -> String {
+    let data = try? JSONSerialization.data(withJSONObject: [s])
+    let arr = data.flatMap { String(data: $0, encoding: .utf8) } ?? "[\"\"]"
+    return String(arr.dropFirst().dropLast()) // ["..."] → "..."
+}
+
 /// 우클릭한 위치의 링크 주소를 앱에 알려줌 (우클릭 메뉴에 '기본 브라우저에서 열기'를 넣기 위해)
 let contextLinkScript = WKUserScript(source: """
 document.addEventListener('contextmenu', function(e){
@@ -1412,6 +1591,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         model.onChange = { [weak self] in self?.apply() }
         model.openConfigFile = { NSWorkspace.shared.open(ConfigStore.url) }
         model.openHistory = { [weak self] in self?.openHistoryWindow() }
+        startPageHandler.html = { [weak self] in
+            guard let self else { return "" }
+            return startPageHTML(links: self.config.quickLinks, engine: self.config.searchEngine)
+        }
         updater.model = model
         updater.onAvailabilityChanged = { [weak self] available in
             // 새 버전이 있으면 메뉴바 아이콘에 표시
@@ -1662,6 +1845,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         if new.showTabBar != old.showTabBar || new.showAddressBar != old.showAddressBar
             || new.addressBarAtBottom != old.addressBarAtBottom { layoutChrome() }
         if new.showTabNames != old.showTabNames { rebuildTabs() }
+        if new.quickLinks != old.quickLinks || new.searchEngine != old.searchEngine {
+            // 열려 있는 시작 페이지를 새 목록으로 다시 그림
+            for wv in webViews.values where wv.url?.scheme == "menucycle" { wv.reload() }
+        }
         if new.opacity != old.opacity { panel.alphaValue = CGFloat(new.opacity) }
 
         if new.pages != old.pages {
@@ -1964,6 +2151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         if popupConfig == nil {
             // 우클릭한 링크 주소를 받는 통로 (팝업은 원래 탭과 같은 통로를 공유하므로 한 번만 등록)
             cfg.userContentController.add(contextLinkHandler, name: "mcContextLink")
+            cfg.setURLSchemeHandler(startPageHandler, forURLScheme: "menucycle")
             cfg.userContentController.addUserScript(contextLinkScript)
         }
         let wv = MCWebView(frame: container.bounds, configuration: cfg)
@@ -2032,7 +2220,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     func followSite(_ id: UUID) {
         guard let i = config.pages.firstIndex(where: { $0.id == id }), config.pages[i].autoName,
               let u = webViews[id]?.url, let host = u.host, !host.isEmpty else { return }
-        let name = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+        let name: String
+        if u.scheme == "menucycle" {
+            name = config.pages[i].incognito ? "시크릿 탭" : "새 탭"
+        } else {
+            name = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+        }
         let s = u.absoluteString
         var p = config.pages[i]
         guard p.url != s || p.name != name else { return }
@@ -2062,7 +2255,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     }
 
     @objc func newIncognitoTab() {
-        let page = PageConfig(name: "시크릿 탭", url: "https://www.google.com", autoName: true, incognito: true)
+        let page = PageConfig(name: "시크릿 탭", url: startPageURL, autoName: true, incognito: true)
         model.config.pages.append(page)
         currentID = page.id
         if panel.isVisible { select(currentIndex, showHUD: false) } else { showPanel() }
@@ -2127,7 +2320,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     }
 
     @objc func newTab() {
-        let page = PageConfig(name: "새 탭", url: "https://www.google.com", autoName: true)
+        let page = PageConfig(name: "새 탭", url: startPageURL, autoName: true)
         model.config.pages.append(page)
         currentID = page.id
         if panel.isVisible { select(currentIndex, showHUD: false) } else { showPanel() }
@@ -2713,7 +2906,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
                 ? "시크릿 탭 · 기록과 쿠키가 남지 않아요" : "주소 또는 검색어 입력 (⌘L)"
         }
         if force || urlField.currentEditor() == nil {
-            if let u = wv?.url?.absoluteString {
+            if let u = wv?.url, u.scheme == "menucycle" {
+                urlField.stringValue = "" // 시작 페이지: 바로 입력할 수 있게 비워 둠
+            } else if let u = wv?.url?.absoluteString {
                 urlField.stringValue = u
             } else if config.pages.indices.contains(currentIndex) {
                 urlField.stringValue = config.pages[currentIndex].url
@@ -2751,7 +2946,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     @objc func goHome() {
         guard let i = currentPageIndex else { return }
         let p = config.pages[i]
-        let home = p.autoName ? config.searchEngine.homeURL : p.url
+        let home = p.autoName ? startPageURL : p.url
         guard let u = normalizedURL(home) else { return }
         currentWebView?.load(URLRequest(url: u))
     }
