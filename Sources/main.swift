@@ -232,6 +232,7 @@ extension QuickLink {
 }
 
 let startPageURL = "menucycle://newtab"
+let bookmarkImportURL = "menucycle://bookmarks-import"
 
 struct PageConfig: Codable, Identifiable, Equatable {
     var id = UUID()
@@ -298,7 +299,7 @@ struct AppConfig: Codable, Equatable {
     var rememberLastPage = true
     var searchEngine: SearchEngine = .google
     var quickLinks: [QuickLink] = AppConfig.defaultQuickLinks
-    var chromeBookmarks = true   // 크롬·웨일·엣지·브레이브 북마크 바로 연동
+    var liveChromeBookmarks = false // 가져오지 않고 크롬 계열 북마크를 항상 최신으로 보기
     var safariBookmarks = false  // Safari 북마크 바로 연동 (전체 디스크 접근 권한 필요)
     var newWindow: NewWindowBehavior = .newTab
     var customUserAgent = ""
@@ -381,7 +382,7 @@ extension AppConfig {
         rememberLastPage = v(.rememberLastPage, rememberLastPage)
         searchEngine = v(.searchEngine, searchEngine)
         quickLinks = v(.quickLinks, quickLinks)
-        chromeBookmarks = v(.chromeBookmarks, chromeBookmarks)
+        liveChromeBookmarks = v(.liveChromeBookmarks, liveChromeBookmarks)
         safariBookmarks = v(.safariBookmarks, safariBookmarks)
         newWindow = v(.newWindow, newWindow)
         customUserAgent = v(.customUserAgent, customUserAgent)
@@ -622,6 +623,7 @@ final class SettingsModel: ObservableObject {
     var openConfigFile: (() -> Void)?
     var openHistory: (() -> Void)?
     var importBookmarks: (() -> Void)?
+    var openBrowserImport: (() -> Void)?
     var clearImportedBookmarks: (() -> Void)?
     @Published var importedBookmarkCount = 0
     var reloadConfigFile: (() -> Void)?
@@ -875,11 +877,10 @@ struct SettingsView: View {
             }
             Divider().padding(.vertical, 4)
             Text("북마크").font(.headline)
-            Text("시작 페이지의 ★ 북마크에서 폴더별로 볼 수 있어요. 연동한 브라우저는 열 때마다 최신 북마크를 읽어 와요.")
+            Text("시작 페이지의 ★ 북마크에서 폴더별로 볼 수 있어요.")
                 .font(.caption).foregroundStyle(.secondary)
-            Toggle("크롬 · 웨일 · 엣지 · 브레이브 북마크 바로 연동", isOn: $model.config.chromeBookmarks)
-            Toggle("Safari 북마크 바로 연동 (전체 디스크 접근 권한 필요)", isOn: $model.config.safariBookmarks)
             HStack {
+                Button("크롬 · 웨일 · 엣지 북마크 가져오기…") { model.openBrowserImport?() }
                 Button("HTML 파일에서 가져오기…") { model.importBookmarks?() }
                 if model.importedBookmarkCount > 0 {
                     Button("가져온 북마크 지우기 (\(model.importedBookmarkCount)개 묶음)") { model.clearImportedBookmarks?() }
@@ -888,6 +889,11 @@ struct SettingsView: View {
             }
             Text("Safari: 파일 → 내보내기 → 책갈피 로 만든 HTML 파일을 가져오면 권한 없이 쓸 수 있어요.")
                 .font(.caption).foregroundStyle(.secondary)
+            DisclosureGroup("고급: 가져오지 않고 바로 연동") {
+                Toggle("크롬 · 웨일 · 엣지 · 브레이브 북마크를 항상 최신 상태로 보기", isOn: $model.config.liveChromeBookmarks)
+                Toggle("Safari 북마크를 항상 최신 상태로 보기 (전체 디스크 접근 권한 필요)", isOn: $model.config.safariBookmarks)
+            }
+            .font(.caption)
         }
     }
 
@@ -1771,9 +1777,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         startPageHandler.render = { [weak self] url in
             guard let self else { return "" }
             if url.host == "bookmarks" { return self.bookmarksPageHTML(url) }
+            if url.host == "bookmarks-import" { return self.importPickerHTML() }
             return startPageHTML(links: self.config.quickLinks, engine: self.config.searchEngine)
         }
         model.importBookmarks = { [weak self] in self?.importBookmarksHTML() }
+        model.openBrowserImport = { [weak self] in self?.openInAppTab(bookmarkImportURL) }
         model.clearImportedBookmarks = { [weak self] in
             self?.bookmarks.imported.removeAll()
             self?.bookmarks.save()
@@ -2034,7 +2042,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             // 열려 있는 시작 페이지를 새 목록으로 다시 그림
             for wv in webViews.values where wv.url?.scheme == "menucycle" { wv.reload() }
         }
-        if new.chromeBookmarks != old.chromeBookmarks || new.safariBookmarks != old.safariBookmarks {
+        if new.liveChromeBookmarks != old.liveChromeBookmarks || new.safariBookmarks != old.safariBookmarks {
             bookmarksChanged()
         }
         if new.opacity != old.opacity { panel.alphaValue = CGFloat(new.opacity) }
@@ -2413,7 +2421,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
               let u = webViews[id]?.url, let host = u.host, !host.isEmpty else { return }
         let name: String
         if u.scheme == "menucycle" {
-            name = u.host == "bookmarks" ? "북마크" : (config.pages[i].incognito ? "시크릿 탭" : "새 탭")
+            name = (u.host ?? "").hasPrefix("bookmarks") ? "북마크" : (config.pages[i].incognito ? "시크릿 탭" : "새 탭")
         } else {
             name = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
         }
@@ -2432,7 +2440,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     func bookmarkRoots() -> (roots: [BMNode], safariDenied: Bool) {
         var roots: [BMNode] = []
         var denied = false
-        if config.chromeBookmarks { roots += BookmarkStore.chromiumRoots() }
+        if config.liveChromeBookmarks { roots += BookmarkStore.chromiumRoots() }
         if config.safariBookmarks {
             switch BookmarkStore.safariRoot() {
             case .ok(let node): roots.append(node)
@@ -2462,6 +2470,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             }
         case "/enable-safari":
             model.config.safariBookmarks = true
+        case "/import-browser":
+            importFromBrowsers(all: item?.first { $0.name == "all" }?.value == "1",
+                               paths: (item?.first { $0.name == "sel" }?.value ?? "")
+                                   .split(separator: ",").map(String.init))
         default:
             break
         }
@@ -2558,15 +2570,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             for n in current where n.children == nil { body += linkRow(n) }
             if current.isEmpty {
                 body += idxs.isEmpty
-                    ? "<p class='empty'>연동된 북마크가 없어요. 설정 → 새 탭에서 브라우저 연동을 켜거나 HTML 파일을 가져오세요.</p>"
+                    ? "<p class='empty'>아직 북마크가 없어요. 아래 버튼으로 브라우저나 HTML 파일에서 가져오세요.</p>"
                     : "<p class='empty'>빈 폴더예요</p>"
             }
             if idxs.isEmpty {
-                body += "<div class='btns'><a class='btn' href='menucycle://action/import-html'>HTML 파일에서 가져오기</a>"
-                if !config.safariBookmarks {
-                    body += "<a class='btn' href='menucycle://action/enable-safari'>Safari 북마크 연동하기</a>"
-                }
-                body += "</div>"
+                body += "<div class='btns'><a class='btn' href='\(bookmarkImportURL)'>크롬 · 웨일 · 엣지 북마크 가져오기</a>"
+                    + "<a class='btn' href='menucycle://action/import-html'>HTML 파일에서 가져오기</a></div>"
             }
         }
 
@@ -2607,6 +2616,151 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         <div class="list">\(body)</div>
         </div></body></html>
         """
+    }
+
+    // MARK: 브라우저 북마크 가져오기 (전체 / 골라서)
+
+    /// 가져올 수 있는 원본: 크롬 계열 + (권한이 있으면) Safari
+    func importSources() -> (sources: [BMNode], safariDenied: Bool) {
+        var src = BookmarkStore.chromiumRoots()
+        var denied = false
+        switch BookmarkStore.safariRoot() {
+        case .ok(let n): src.append(n)
+        case .denied: denied = true
+        case .missing: break
+        }
+        return (src, denied)
+    }
+
+    func importPickerHTML() -> String {
+        let (sources, denied) = importSources()
+        func host(_ s: String) -> String { URL(string: s)?.host?.replacingOccurrences(of: "www.", with: "") ?? "" }
+        func render(_ nodes: [BMNode], _ prefix: String, _ depth: Int) -> String {
+            var out = ""
+            for (i, n) in nodes.enumerated() {
+                let path = prefix.isEmpty ? "\(i)" : "\(prefix)/\(i)"
+                if let kids = n.children {
+                    out += "<details\(depth < 1 ? " open" : "")><summary><label><input type='checkbox' data-p='\(path)'>"
+                        + "<span class='f'>📁</span> <span class='t'>\(htmlEscape(n.title))</span>"
+                        + " <span class='c'>\(n.linkCount)</span></label></summary><div class='kids'>"
+                        + render(kids, path, depth + 1) + "</div></details>"
+                } else if let u = n.url {
+                    out += "<label class='lk'><input type='checkbox' data-p='\(path)' data-l='1'>"
+                        + "<span class='t'>\(htmlEscape(n.title.isEmpty ? u : n.title))</span> <span class='c'>\(htmlEscape(host(u)))</span></label>"
+                }
+            }
+            return out
+        }
+        let total = sources.reduce(0) { $0 + $1.linkCount }
+        let tree = sources.isEmpty
+            ? "<p class='empty'>가져올 브라우저 북마크를 찾지 못했어요. (크롬·웨일·엣지·브레이브)</p>"
+            : render(sources, "", 0)
+        let safariNote = denied
+            ? "<p class='note'>Safari 북마크는 macOS 보호 때문에 바로 읽을 수 없어요. Safari에서 <b>파일 → 내보내기 → 책갈피</b>로 HTML 파일을 만든 뒤 <a href='menucycle://action/import-html'>HTML 파일에서 가져오기</a>를 쓰세요.</p>"
+            : ""
+        return """
+        <!doctype html><html lang="ko"><head><meta charset="utf-8"><title>북마크 가져오기</title>
+        <style>
+        :root{--bg:#f5f5f7;--fg:#1d1d1f;--sub:#6e6e73;--card:#fff;--line:#e5e5ea}
+        @media (prefers-color-scheme:dark){:root{--bg:#1c1c1e;--fg:#f5f5f7;--sub:#a1a1a6;--card:#2c2c2e;--line:#3a3a3c}}
+        *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,"Apple SD Gothic Neo",sans-serif;padding:20px 16px 90px}
+        .wrap{max-width:640px;margin:0 auto} h1{font-size:18px;margin:4px 0 4px} .sub{color:var(--sub);font-size:12.5px;margin:0 0 14px}
+        .back{color:var(--sub);font-size:13px;text-decoration:none}
+        .tree{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:8px 10px}
+        details{margin:2px 0} summary{list-style:none;cursor:pointer;padding:5px 4px;border-radius:6px}
+        summary::-webkit-details-marker{display:none}
+        summary::before{content:'▸';display:inline-block;width:14px;color:var(--sub);transition:transform .15s}
+        details[open]>summary::before{transform:rotate(90deg)}
+        .kids{padding-left:20px} label{display:inline-flex;align-items:center;gap:6px;font-size:13px;min-width:0}
+        .lk{display:flex;padding:4px 4px 4px 18px} .t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:380px}
+        .c{color:var(--sub);font-size:11.5px} input{margin:0}
+        .bar{position:fixed;left:0;right:0;bottom:0;background:var(--card);border-top:1px solid var(--line);padding:12px 16px;display:flex;gap:8px;align-items:center;justify-content:center}
+        .btn{font-size:13px;padding:8px 14px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg);text-decoration:none;cursor:pointer}
+        .btn.primary{background:#0a84ff;border-color:#0a84ff;color:#fff} .btn[disabled]{opacity:.4;pointer-events:none}
+        #cnt{color:var(--sub);font-size:12.5px;margin-right:auto}
+        .note{font-size:12.5px;color:var(--sub);line-height:1.6} .note a{color:#0a84ff} .empty{color:var(--sub);font-size:13px;padding:10px}
+        </style></head><body><div class="wrap">
+        <a class="back" href="menucycle://bookmarks">‹ 북마크</a>
+        <h1>브라우저 북마크 가져오기</h1>
+        <p class="sub">전체를 한 번에 가져오거나, 폴더·북마크를 골라서 가져올 수 있어요. (총 \(total)개)</p>
+        \(safariNote)
+        <div class="tree">\(tree)</div>
+        </div>
+        <div class="bar"><span id="cnt">선택 0개</span>
+        <a class="btn" href="menucycle://action/import-browser?all=1">전체 가져오기</a>
+        <a class="btn primary" id="sel" disabled>선택한 것 가져오기</a></div>
+        <script>
+        var boxes = Array.prototype.slice.call(document.querySelectorAll('input[type=checkbox]'));
+        function kidsOf(b){ var d = b.closest('details'); return (d && b.closest('summary')) ? d.querySelectorAll('.kids input') : []; }
+        function chosen(){
+          // 선택된 것 중 위쪽 폴더가 이미 선택된 것은 빼고 맨 위 것만
+          return boxes.filter(function(b){
+            if (!b.checked) return false;
+            var d = b.closest('summary') ? b.closest('details').parentElement.closest('details') : b.closest('details');
+            while (d) { var s = d.querySelector(':scope>summary input'); if (s && s.checked) return false; d = d.parentElement.closest('details'); }
+            return true;
+          });
+        }
+        function refresh(){
+          var n = boxes.filter(function(b){ return b.checked && b.dataset.l; }).length;
+          document.getElementById('cnt').textContent = '선택 ' + n + '개';
+          var sel = document.getElementById('sel');
+          if (n > 0) sel.removeAttribute('disabled'); else sel.setAttribute('disabled', '');
+        }
+        boxes.forEach(function(b){
+          b.addEventListener('change', function(){
+            Array.prototype.forEach.call(kidsOf(b), function(k){ k.checked = b.checked; k.indeterminate = false; });
+            refresh();
+          });
+        });
+        document.getElementById('sel').addEventListener('click', function(e){
+          e.preventDefault();
+          var paths = chosen().map(function(b){ return b.dataset.p; });
+          if (paths.length) location.href = 'menucycle://action/import-browser?sel=' + encodeURIComponent(paths.join(','));
+        });
+        </script></body></html>
+        """
+    }
+
+    func importFromBrowsers(all: Bool, paths: [String]) {
+        let (sources, _) = importSources()
+        var picked: [BMNode] = []
+        if all {
+            picked = sources
+        } else {
+            for p in paths {
+                let idx = p.split(separator: "/").compactMap { Int($0) }
+                guard let first = idx.first, sources.indices.contains(first) else { continue }
+                var node = sources[first]
+                var ok = true
+                for i in idx.dropFirst() {
+                    guard let kids = node.children, kids.indices.contains(i) else { ok = false; break }
+                    node = kids[i]
+                }
+                guard ok else { continue }
+                // 브라우저 바로 아래 폴더(북마크바 등)는 어느 브라우저 것인지 이름에 붙임
+                if idx.count == 2, node.children != nil { node.title = "\(sources[first].title) · \(node.title)" }
+                picked.append(node)
+            }
+        }
+        let count = picked.reduce(0) { $0 + $1.linkCount }
+        guard count > 0 else { flash("가져올 북마크가 없어요"); return }
+        let df = DateFormatter()
+        df.dateFormat = "yyyy.MM.dd"
+        let label = all ? "브라우저 북마크 전체" : "브라우저 북마크 (선택)"
+        bookmarks.imported.append(BMNode(title: "\(label) · \(df.string(from: Date()))", url: nil, children: picked))
+        bookmarks.save()
+        bookmarksChanged()
+        currentWebView?.load(URLRequest(url: URL(string: "menucycle://bookmarks")!))
+        flash("북마크 \(count)개를 가져왔어요")
+    }
+
+    /// 앱 안에서 주소 열기 (창이 닫혀 있으면 열고, 새 탭으로)
+    func openInAppTab(_ s: String) {
+        let page = PageConfig(name: "북마크", url: s, autoName: true)
+        model.config.pages.append(page)
+        currentID = page.id
+        showPanel()
     }
 
     // MARK: 방문 기록 · 시크릿 탭
