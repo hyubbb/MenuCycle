@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/icon.png" width="128" alt="MenuCycle 아이콘"></p>
+
 # MenuCycle
 
 메뉴바에서 웹페이지를 띄워 쓰는 macOS 앱입니다. [MenubarX](https://menubarx.app)에서 아이디어를 얻었고, **단축키 하나로 여러 탭을 순환**하는 기능을 중심으로 만들었습니다.
@@ -172,6 +174,7 @@ defaults delete local.menucycle.app 2>/dev/null
 ```
 MenuCycle/
 ├── Sources/main.swift   # 앱 전체 (AppKit + SwiftUI 설정 창 + WebKit)
+├── Resources/           # 앱 아이콘(AppIcon.svg → AppIcon.icns), 메뉴바 아이콘 원본(MenuBarIcon.svg)
 ├── build.sh             # swiftc로 빌드 → .app 번들 생성 → ad-hoc 서명 (install 시 설치·실행, UNIVERSAL=1이면 Intel+Apple Silicon)
 ├── 업데이트.command      # 더블클릭하면 build.sh install 실행
 ├── .github/workflows/release.yml  # 푸시할 때마다 앱 빌드 → Releases에 DMG 업로드

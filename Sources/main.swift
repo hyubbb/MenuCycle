@@ -1260,6 +1260,37 @@ func muteScript(_ on: Bool) -> WKUserScript {
     return WKUserScript(source: src, injectionTime: .atDocumentEnd, forMainFrameOnly: false)
 }
 
+/// 메뉴바 아이콘: 창 테두리 안 위쪽에 탭 3개 (Resources/MenuBarIcon.svg 와 같은 모양).
+/// 템플릿 이미지라 라이트/다크 메뉴바에 맞게 자동으로 색이 바뀜. badge: 새 버전 있음 표시 점
+func menuBarIcon(badge: Bool) -> NSImage {
+    let img = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
+        let black = NSColor.black
+        black.setStroke()
+        let frame = NSBezierPath(roundedRect: NSRect(x: 1.8, y: 2.6, width: 14.4, height: 12.8), xRadius: 2.6, yRadius: 2.6)
+        frame.lineWidth = 1.5
+        frame.stroke()
+        black.setFill()
+        NSBezierPath(roundedRect: NSRect(x: 3.9, y: 4.6, width: 3, height: 2.3), xRadius: 0.7, yRadius: 0.7).fill()
+        black.withAlphaComponent(0.4).setFill()
+        NSBezierPath(roundedRect: NSRect(x: 7.5, y: 4.6, width: 3, height: 2.3), xRadius: 0.7, yRadius: 0.7).fill()
+        NSBezierPath(roundedRect: NSRect(x: 11.1, y: 4.6, width: 3, height: 2.3), xRadius: 0.7, yRadius: 0.7).fill()
+        black.setFill()
+        NSRect(x: 1.8, y: 7.4, width: 14.4, height: 1.2).fill()
+        if badge {
+            // 오른쪽 위 모서리를 지우고 점 찍기
+            NSGraphicsContext.current?.compositingOperation = .clear
+            NSBezierPath(ovalIn: NSRect(x: 10.5, y: 0, width: 7.5, height: 7.5)).fill()
+            NSGraphicsContext.current?.compositingOperation = .sourceOver
+            black.setFill()
+            NSBezierPath(ovalIn: NSRect(x: 12, y: 1.5, width: 4.5, height: 4.5)).fill()
+        }
+        return true
+    }
+    img.isTemplate = true
+    img.accessibilityDescription = "MenuCycle"
+    return img
+}
+
 /// 우클릭한 위치의 링크 주소를 앱에 알려줌 (우클릭 메뉴에 '기본 브라우저에서 열기'를 넣기 위해)
 let contextLinkScript = WKUserScript(source: """
 document.addEventListener('contextmenu', function(e){
@@ -1384,9 +1415,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         updater.model = model
         updater.onAvailabilityChanged = { [weak self] available in
             // 새 버전이 있으면 메뉴바 아이콘에 표시
-            self?.statusItem.button?.image = NSImage(
-                systemSymbolName: available ? "rectangle.stack.badge.plus" : "rectangle.stack",
-                accessibilityDescription: "MenuCycle")
+            self?.statusItem.button?.image = menuBarIcon(badge: available)
         }
         model.checkUpdate = { [weak self] in self?.updater.check(manual: true) }
         model.installUpdate = { [weak self] in self?.updater.install() }
@@ -1461,7 +1490,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let b = statusItem.button {
-            b.image = NSImage(systemSymbolName: "rectangle.stack", accessibilityDescription: "MenuCycle")
+            b.image = menuBarIcon(badge: false)
             b.target = self
             b.action = #selector(statusClicked(_:))
             b.sendAction(on: [.leftMouseUp, .rightMouseUp])
