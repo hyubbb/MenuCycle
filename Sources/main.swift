@@ -2069,8 +2069,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
 
     func windowDidEndLiveResize(_ notification: Notification) {
         guard notification.object as? NSWindow === panel, !isApplying else { return }
-        model.config.width = Double(panel.frame.width.rounded())
-        model.config.height = Double(panel.frame.height.rounded())
+        // 너비·높이를 한 번에 저장 (따로 저장하면 중간에 예전 높이로 창이 되돌아감)
+        var c = model.config
+        c.width = Double(panel.frame.width.rounded())
+        c.height = Double(panel.frame.height.rounded())
+        model.config = c
     }
 
     func windowDidMove(_ notification: Notification) {
