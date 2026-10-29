@@ -2,6 +2,19 @@
 
 # MenuCycle
 
+**기술 스택** · Swift 5 · AppKit · SwiftUI · WebKit (WKWebView) · Carbon (전역 단축키) · ServiceManagement · URLSession + GitHub REST API · GitHub Actions (CI/CD) — 외부 라이브러리 없이 Apple 기본 프레임워크만 사용
+
+| 분야 | 사용 기술 | 쓰인 곳 |
+|---|---|---|
+| 언어 | Swift 5 | 앱 전체 (단일 파일, Xcode 프로젝트 없이 `swiftc`로 빌드) |
+| UI | AppKit — `NSStatusItem`, `NSPanel`, `NSStackView`, `NSPopover`, `NSMenu` | 메뉴바 아이콘, 떠 있는 창, 탭 막대(드래그 정렬), 투명도 슬라이더, 우클릭 메뉴 |
+| UI | SwiftUI — `ObservableObject`, `Form`, `TabView`, `List`, `NSViewRepresentable` | 설정 창, 방문 기록 창, 단축키 입력 칸 |
+| 웹 | WebKit — `WKWebView`, `WKNavigationDelegate`, `WKUIDelegate`, `WKDownload`, `WKUserScript`, `WKScriptMessageHandler`, `WKWebsiteDataStore` | 탭별 웹페이지, 새 창·로그인 팝업 처리, 다운로드, 음소거·우클릭 링크 스크립트, 시크릿 탭(비영구 저장소) |
+| 시스템 | Carbon `RegisterEventHotKey` | 손쉬운 사용 권한 없이 동작하는 전역 단축키 |
+| 시스템 | ServiceManagement `SMAppService` | 로그인 시 자동 실행 |
+| 시스템 | Foundation — `URLSession`, `Codable`, KVO, `Process` | GitHub API로 업데이트 확인·다운로드·자체 교체, 설정·기록 JSON 저장 |
+| 배포 | bash, `codesign`, `lipo`(Universal Binary), `hdiutil`(DMG), GitHub Actions(macOS runner), GitHub Releases | 빌드 스크립트, Apple Silicon + Intel 빌드, 푸시할 때마다 자동 빌드·릴리스 |
+
 메뉴바에서 웹페이지를 띄워 쓰는 macOS 앱입니다. [MenubarX](https://menubarx.app)에서 아이디어를 얻었고, **단축키 하나로 여러 탭을 순환**하는 기능을 중심으로 만들었습니다.
 
 - 단축키로 창을 열고 닫으며, 다른 단축키로 1번 → 2번 → 3번 탭을 돌아가며 볼 수 있습니다
