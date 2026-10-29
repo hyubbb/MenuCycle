@@ -6,6 +6,7 @@ import SwiftUI
 import WebKit
 import Carbon.HIToolbox
 import ServiceManagement
+import UniformTypeIdentifiers
 
 // MARK: - 키 코드
 
@@ -297,6 +298,8 @@ struct AppConfig: Codable, Equatable {
     var rememberLastPage = true
     var searchEngine: SearchEngine = .google
     var quickLinks: [QuickLink] = AppConfig.defaultQuickLinks
+    var chromeBookmarks = true   // 크롬·웨일·엣지·브레이브 북마크 바로 연동
+    var safariBookmarks = false  // Safari 북마크 바로 연동 (전체 디스크 접근 권한 필요)
     var newWindow: NewWindowBehavior = .newTab
     var customUserAgent = ""
 
@@ -378,6 +381,8 @@ extension AppConfig {
         rememberLastPage = v(.rememberLastPage, rememberLastPage)
         searchEngine = v(.searchEngine, searchEngine)
         quickLinks = v(.quickLinks, quickLinks)
+        chromeBookmarks = v(.chromeBookmarks, chromeBookmarks)
+        safariBookmarks = v(.safariBookmarks, safariBookmarks)
         newWindow = v(.newWindow, newWindow)
         customUserAgent = v(.customUserAgent, customUserAgent)
         unloadMinutes = v(.unloadMinutes, unloadMinutes)
@@ -616,6 +621,9 @@ final class SettingsModel: ObservableObject {
     var onChange: (() -> Void)?
     var openConfigFile: (() -> Void)?
     var openHistory: (() -> Void)?
+    var importBookmarks: (() -> Void)?
+    var clearImportedBookmarks: (() -> Void)?
+    @Published var importedBookmarkCount = 0
     var reloadConfigFile: (() -> Void)?
 
     init(config: AppConfig) { self.config = config }
@@ -865,6 +873,21 @@ struct SettingsView: View {
                 Spacer()
                 Button("기본 목록으로 되돌리기") { model.config.quickLinks = AppConfig.defaultQuickLinks }
             }
+            Divider().padding(.vertical, 4)
+            Text("북마크").font(.headline)
+            Text("시작 페이지의 ★ 북마크에서 폴더별로 볼 수 있어요. 연동한 브라우저는 열 때마다 최신 북마크를 읽어 와요.")
+                .font(.caption).foregroundStyle(.secondary)
+            Toggle("크롬 · 웨일 · 엣지 · 브레이브 북마크 바로 연동", isOn: $model.config.chromeBookmarks)
+            Toggle("Safari 북마크 바로 연동 (전체 디스크 접근 권한 필요)", isOn: $model.config.safariBookmarks)
+            HStack {
+                Button("HTML 파일에서 가져오기…") { model.importBookmarks?() }
+                if model.importedBookmarkCount > 0 {
+                    Button("가져온 북마크 지우기 (\(model.importedBookmarkCount)개 묶음)") { model.clearImportedBookmarks?() }
+                }
+                Spacer()
+            }
+            Text("Safari: 파일 → 내보내기 → 책갈피 로 만든 HTML 파일을 가져오면 권한 없이 쓸 수 있어요.")
+                .font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -1358,14 +1381,166 @@ func menuBarIcon(badge: Bool) -> NSImage {
     return img
 }
 
+// MARK: - 북마크
+
+struct BMNode: Codable {
+    var title: String
+    var url: String?          // nil 이면 폴더
+    var children: [BMNode]?
+
+    var linkCount: Int { children?.reduce(0) { $0 + $1.linkCount } ?? (url == nil ? 0 : 1) }
+}
+
+enum SafariResult { case ok(BMNode), denied, missing }
+
+final class BookmarkStore {
+    var imported: [BMNode] = [] // HTML 파일에서 가져온 묶음 (각각 폴더 하나)
+
+    static var fileURL: URL { ConfigStore.url.deletingLastPathComponent().appendingPathComponent("bookmarks.json") }
+
+    init() {
+        if let d = try? Data(contentsOf: BookmarkStore.fileURL),
+           let v = try? JSONDecoder().decode([BMNode].self, from: d) { imported = v }
+    }
+
+    func save() {
+        if let d = try? JSONEncoder().encode(imported) { try? d.write(to: BookmarkStore.fileURL, options: .atomic) }
+    }
+
+    /// 크롬 계열 브라우저: 북마크가 JSON 파일이라 권한 없이 바로 읽을 수 있음
+    static func chromiumRoots() -> [BMNode] {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let browsers = [("Chrome", "Google/Chrome"), ("웨일", "Naver/Whale"),
+                        ("Edge", "Microsoft Edge"), ("Brave", "BraveSoftware/Brave-Browser")]
+        var out: [BMNode] = []
+        for (label, rel) in browsers {
+            let base = support.appendingPathComponent(rel)
+            guard let dirs = try? FileManager.default.contentsOfDirectory(atPath: base.path) else { continue }
+            // 프로필 이름 (Local State)
+            var names: [String: String] = [:]
+            if let d = try? Data(contentsOf: base.appendingPathComponent("Local State")),
+               let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+               let cache = (j["profile"] as? [String: Any])?["info_cache"] as? [String: Any] {
+                for (k, v) in cache { if let n = (v as? [String: Any])?["name"] as? String { names[k] = n } }
+            }
+            let profiles = dirs.filter { $0 == "Default" || $0.hasPrefix("Profile ") }.sorted()
+            var found: [(String, BMNode)] = []
+            for prof in profiles {
+                let f = base.appendingPathComponent(prof).appendingPathComponent("Bookmarks")
+                guard let d = try? Data(contentsOf: f),
+                      let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                      let roots = j["roots"] as? [String: Any] else { continue }
+                var kids: [BMNode] = []
+                for (key, title) in [("bookmark_bar", "북마크바"), ("other", "기타 북마크"), ("synced", "모바일 북마크")] {
+                    if let r = roots[key] as? [String: Any], var node = convertChrome(r), node.linkCount > 0 {
+                        node.title = title
+                        kids.append(node)
+                    }
+                }
+                if !kids.isEmpty { found.append((names[prof] ?? prof, BMNode(title: "", url: nil, children: kids))) }
+            }
+            for (pname, node) in found {
+                var n = node
+                n.title = found.count > 1 ? "\(label) · \(pname)" : label
+                out.append(n)
+            }
+        }
+        return out
+    }
+
+    private static func convertChrome(_ d: [String: Any]) -> BMNode? {
+        let name = d["name"] as? String ?? ""
+        if (d["type"] as? String) == "url" { return BMNode(title: name, url: d["url"] as? String, children: nil) }
+        let kids = (d["children"] as? [[String: Any]] ?? []).compactMap(convertChrome)
+        return BMNode(title: name, url: nil, children: kids)
+    }
+
+    /// Safari: ~/Library/Safari/Bookmarks.plist 는 macOS가 보호하는 위치라 전체 디스크 접근 권한이 있어야 읽힘
+    static func safariRoot() -> SafariResult {
+        let f = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Safari/Bookmarks.plist")
+        guard FileManager.default.fileExists(atPath: f.path) else { return .missing }
+        guard let d = try? Data(contentsOf: f),
+              let plist = try? PropertyListSerialization.propertyList(from: d, format: nil) as? [String: Any] else {
+            return .denied
+        }
+        var root = convertSafari(plist) ?? BMNode(title: "", url: nil, children: [])
+        root.title = "Safari"
+        root.children = root.children?.filter { $0.linkCount > 0 }
+        return .ok(root)
+    }
+
+    private static func convertSafari(_ d: [String: Any]) -> BMNode? {
+        switch d["WebBookmarkType"] as? String {
+        case "WebBookmarkTypeLeaf":
+            let u = d["URLString"] as? String
+            let t = (d["URIDictionary"] as? [String: Any])?["title"] as? String ?? u ?? ""
+            return BMNode(title: t, url: u, children: nil)
+        case "WebBookmarkTypeList":
+            var title = d["Title"] as? String ?? ""
+            switch title {
+            case "BookmarksBar": title = "즐겨찾기"
+            case "BookmarksMenu": title = "북마크 메뉴"
+            case "com.apple.ReadingList": title = "읽기 목록"
+            default: break
+            }
+            let kids = (d["Children"] as? [[String: Any]] ?? []).compactMap(convertSafari)
+            return BMNode(title: title, url: nil, children: kids)
+        default:
+            return nil // 방문 기록 같은 특수 항목
+        }
+    }
+}
+
+/// 브라우저가 내보낸 북마크 HTML (Netscape 형식: <DT><H3>폴더</H3><DL>…</DL>, <DT><A HREF>…)
+func parseBookmarkHTML(_ html: String) -> [BMNode] {
+    let pattern = #"</DL>|<DL[\s>]|<H3[^>]*>([\s\S]*?)</H3>|<A\s[^>]*?HREF="([^"]*)"[^>]*>([\s\S]*?)</A>"#
+    guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
+    let ns = html as NSString
+    func text(_ r: NSRange) -> String {
+        guard r.location != NSNotFound else { return "" }
+        return ns.substring(with: r)
+            .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "&amp;", with: "&").replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">").replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    var stack: [BMNode] = [BMNode(title: "", url: nil, children: [])]
+    var pendingFolder: String?
+    for m in re.matches(in: html, range: NSRange(location: 0, length: ns.length)) {
+        let tok = ns.substring(with: m.range).uppercased()
+        if tok.hasPrefix("</DL") {
+            if stack.count > 1 {
+                let done = stack.removeLast()
+                stack[stack.count - 1].children?.append(done)
+            }
+        } else if tok.hasPrefix("<DL") {
+            if let f = pendingFolder {
+                stack.append(BMNode(title: f, url: nil, children: []))
+                pendingFolder = nil
+            }
+        } else if tok.hasPrefix("<H3") {
+            pendingFolder = text(m.range(at: 1))
+        } else {
+            let url = text(m.range(at: 2))
+            let title = text(m.range(at: 3))
+            if !url.isEmpty { stack[stack.count - 1].children?.append(BMNode(title: title, url: url, children: nil)) }
+        }
+    }
+    while stack.count > 1 {
+        let done = stack.removeLast()
+        stack[stack.count - 1].children?.append(done)
+    }
+    return stack[0].children ?? []
+}
+
 // MARK: - 새 탭 시작 페이지 (menucycle://newtab)
 
 final class StartPageHandler: NSObject, WKURLSchemeHandler {
-    var html: () -> String = { "" }
+    var render: (URL) -> String = { _ in "" }
 
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
-        let data = Data(html().utf8)
         let url = task.request.url ?? URL(string: startPageURL)!
+        let data = Data(render(url).utf8)
         task.didReceive(URLResponse(url: url, mimeType: "text/html", expectedContentLength: data.count,
                                     textEncodingName: "utf-8"))
         task.didReceive(data)
@@ -1427,6 +1602,7 @@ func startPageHTML(links: [QuickLink], engine: SearchEngine) -> String {
         let href = l.url.contains("://") ? l.url : "https://" + l.url
         return "<a class='tile' href='\(htmlEscape(href))'><div class='ic'>\(quickLinkIcon(l))</div><div class='nm'>\(htmlEscape(l.name))</div></a>"
     }.joined()
+    let bookmarkTile = "<a class='tile' href='menucycle://bookmarks'><div class='ic'><svg viewBox='0 0 64 64'><rect width='64' height='64' rx='16' fill='#ffb800'/><path d='M32 15l5.3 10.8 11.9 1.7-8.6 8.4 2 11.8L32 42.2l-10.6 5.5 2-11.8-8.6-8.4 11.9-1.7z' fill='#fff'/></svg></div><div class='nm'>북마크</div></a>"
     let tpl = engine.searchURL("__Q__")?.absoluteString ?? "https://www.google.com/search?q=__Q__"
     return """
     <!doctype html><html lang="ko"><head><meta charset="utf-8"><title>새 탭</title>
@@ -1450,7 +1626,7 @@ func startPageHTML(links: [QuickLink], engine: SearchEngine) -> String {
     .empty{color:var(--sub);font-size:13px}
     </style></head><body>
     <form id="f"><input id="q" placeholder="검색어 또는 주소 입력" autocomplete="off"></form>
-    <div class="grid">\(tiles.isEmpty ? "<div class='empty'>설정 → 새 탭에서 바로가기를 추가하세요</div>" : tiles)</div>
+    <div class="grid">\(bookmarkTile + tiles)</div>
     <script>
     document.getElementById('f').addEventListener('submit', function(e){
       e.preventDefault();
@@ -1564,6 +1740,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     var maintenanceTimer: Timer?
     var closedTabs: [(page: PageConfig, index: Int)] = []
     let history = HistoryStore()
+    let bookmarks = BookmarkStore()
     let updater = Updater()
     var updateTimer: Timer?
     var historyWindow: NSWindow?
@@ -1591,10 +1768,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         model.onChange = { [weak self] in self?.apply() }
         model.openConfigFile = { NSWorkspace.shared.open(ConfigStore.url) }
         model.openHistory = { [weak self] in self?.openHistoryWindow() }
-        startPageHandler.html = { [weak self] in
+        startPageHandler.render = { [weak self] url in
             guard let self else { return "" }
+            if url.host == "bookmarks" { return self.bookmarksPageHTML(url) }
             return startPageHTML(links: self.config.quickLinks, engine: self.config.searchEngine)
         }
+        model.importBookmarks = { [weak self] in self?.importBookmarksHTML() }
+        model.clearImportedBookmarks = { [weak self] in
+            self?.bookmarks.imported.removeAll()
+            self?.bookmarks.save()
+            self?.bookmarksChanged()
+        }
+        model.importedBookmarkCount = bookmarks.imported.count
         updater.model = model
         updater.onAvailabilityChanged = { [weak self] available in
             // 새 버전이 있으면 메뉴바 아이콘에 표시
@@ -1848,6 +2033,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         if new.quickLinks != old.quickLinks || new.searchEngine != old.searchEngine {
             // 열려 있는 시작 페이지를 새 목록으로 다시 그림
             for wv in webViews.values where wv.url?.scheme == "menucycle" { wv.reload() }
+        }
+        if new.chromeBookmarks != old.chromeBookmarks || new.safariBookmarks != old.safariBookmarks {
+            bookmarksChanged()
         }
         if new.opacity != old.opacity { panel.alphaValue = CGFloat(new.opacity) }
 
@@ -2225,7 +2413,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
               let u = webViews[id]?.url, let host = u.host, !host.isEmpty else { return }
         let name: String
         if u.scheme == "menucycle" {
-            name = config.pages[i].incognito ? "시크릿 탭" : "새 탭"
+            name = u.host == "bookmarks" ? "북마크" : (config.pages[i].incognito ? "시크릿 탭" : "새 탭")
         } else {
             name = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
         }
@@ -2236,6 +2424,189 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         p.url = s
         p.name = name
         model.config.pages[i] = p
+    }
+
+    // MARK: 북마크
+
+    /// 연동한 브라우저 + 가져온 북마크를 최상위 폴더 목록으로 (열 때마다 새로 읽음 = 바로 연동)
+    func bookmarkRoots() -> (roots: [BMNode], safariDenied: Bool) {
+        var roots: [BMNode] = []
+        var denied = false
+        if config.chromeBookmarks { roots += BookmarkStore.chromiumRoots() }
+        if config.safariBookmarks {
+            switch BookmarkStore.safariRoot() {
+            case .ok(let node): roots.append(node)
+            case .denied: denied = true
+            case .missing: break
+            }
+        }
+        roots += bookmarks.imported
+        return (roots, denied)
+    }
+
+    func bookmarksChanged() {
+        model.importedBookmarkCount = bookmarks.imported.count
+        for wv in webViews.values where wv.url?.host == "bookmarks" { wv.reload() }
+    }
+
+    func handlePageAction(_ u: URL) {
+        let item = URLComponents(url: u, resolvingAgainstBaseURL: false)?.queryItems
+        switch u.path {
+        case "/import-html":
+            importBookmarksHTML()
+        case "/delete-import":
+            if let s = item?.first(where: { $0.name == "i" })?.value, let i = Int(s), bookmarks.imported.indices.contains(i) {
+                bookmarks.imported.remove(at: i)
+                bookmarks.save()
+                bookmarksChanged()
+            }
+        case "/enable-safari":
+            model.config.safariBookmarks = true
+        default:
+            break
+        }
+    }
+
+    @objc func importBookmarksHTML() {
+        let p = NSOpenPanel()
+        p.allowedContentTypes = [UTType.html]
+        p.allowsMultipleSelection = true
+        p.message = "브라우저에서 내보낸 북마크 HTML 파일을 고르세요 (Safari: 파일 → 내보내기 → 책갈피)"
+        p.prompt = "가져오기"
+        NSApp.activate(ignoringOtherApps: true)
+        guard p.runModal() == .OK else { return }
+        var total = 0
+        let df = DateFormatter()
+        df.dateFormat = "yyyy.MM.dd"
+        for file in p.urls {
+            guard let data = try? Data(contentsOf: file) else { continue }
+            let html = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+            let nodes = parseBookmarkHTML(html)
+            let count = nodes.reduce(0) { $0 + $1.linkCount }
+            guard count > 0 else { continue }
+            total += count
+            let name = file.deletingPathExtension().lastPathComponent
+            bookmarks.imported.append(BMNode(title: "가져온 북마크 · \(name) (\(df.string(from: Date())))",
+                                             url: nil, children: nodes))
+        }
+        bookmarks.save()
+        bookmarksChanged()
+        flash(total > 0 ? "북마크 \(total)개를 가져왔어요" : "가져올 북마크를 찾지 못했어요")
+    }
+
+    func bookmarksPageHTML(_ url: URL) -> String {
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        let pathStr = items.first { $0.name == "p" }?.value ?? ""
+        let query = (items.first { $0.name == "q" }?.value ?? "").trimmingCharacters(in: .whitespaces)
+        let (roots, denied) = bookmarkRoots()
+
+        // 경로(인덱스 목록)를 따라 현재 폴더 찾기
+        var trail: [(title: String, path: String)] = [("북마크", "")]
+        var current = roots
+        var idxs: [Int] = []
+        for part in pathStr.split(separator: "/") {
+            guard let i = Int(part), current.indices.contains(i), let kids = current[i].children else { break }
+            idxs.append(i)
+            trail.append((current[i].title, idxs.map(String.init).joined(separator: "/")))
+            current = kids
+        }
+        let here = idxs.map(String.init).joined(separator: "/")
+        let importedStart = roots.count - bookmarks.imported.count
+
+        func host(_ s: String) -> String { URL(string: s)?.host?.replacingOccurrences(of: "www.", with: "") ?? "" }
+        func linkRow(_ n: BMNode, sub: String? = nil) -> String {
+            let u = n.url ?? ""
+            let t = n.title.isEmpty ? u : n.title
+            let letter = htmlEscape(String(host(u).prefix(1)).uppercased())
+            return "<a class='row' href='\(htmlEscape(u))'><span class='ic'>\(letter.isEmpty ? "•" : letter)</span>"
+                + "<span class='t'>\(htmlEscape(t))</span><span class='u'>\(htmlEscape(sub ?? host(u)))</span></a>"
+        }
+
+        var body = ""
+        if !query.isEmpty {
+            // 전체 검색
+            var hits: [String] = []
+            func walk(_ nodes: [BMNode], _ path: String) {
+                for n in nodes {
+                    if hits.count >= 300 { return }
+                    if let kids = n.children { walk(kids, path.isEmpty ? n.title : path + " › " + n.title) }
+                    else if let u = n.url, (n.title + " " + u).lowercased().contains(query.lowercased()) {
+                        hits.append(linkRow(n, sub: path))
+                    }
+                }
+            }
+            walk(roots, "")
+            body = hits.isEmpty ? "<p class='empty'>'\(htmlEscape(query))'에 맞는 북마크가 없어요</p>" : hits.joined()
+        } else {
+            if idxs.isEmpty && denied {
+                body += """
+                <div class='note'><b>Safari 북마크를 읽으려면 권한이 필요해요.</b><br>
+                시스템 설정 → 개인정보 보호 및 보안 → <b>전체 디스크 접근 권한</b>에서 MenuCycle을 켜고 앱을 다시 실행하세요.
+                <div class='btns'><a class='btn' href='x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles'>시스템 설정 열기</a>
+                <a class='btn' href='menucycle://action/import-html'>대신 HTML 파일로 가져오기</a></div></div>
+                """
+            }
+            for (i, n) in current.enumerated() where n.children != nil {
+                let p = here.isEmpty ? "\(i)" : "\(here)/\(i)"
+                var del = ""
+                if idxs.isEmpty && i >= importedStart {
+                    del = "<a class='del' href='menucycle://action/delete-import?i=\(i - importedStart)' title='삭제'>삭제</a>"
+                }
+                body += "<div class='frow'><a class='row folder' href='menucycle://bookmarks?p=\(p)'><span class='ic'>📁</span>"
+                    + "<span class='t'>\(htmlEscape(n.title))</span><span class='u'>\(n.linkCount)</span></a>\(del)</div>"
+            }
+            for n in current where n.children == nil { body += linkRow(n) }
+            if current.isEmpty {
+                body += idxs.isEmpty
+                    ? "<p class='empty'>연동된 북마크가 없어요. 설정 → 새 탭에서 브라우저 연동을 켜거나 HTML 파일을 가져오세요.</p>"
+                    : "<p class='empty'>빈 폴더예요</p>"
+            }
+            if idxs.isEmpty {
+                body += "<div class='btns'><a class='btn' href='menucycle://action/import-html'>HTML 파일에서 가져오기</a>"
+                if !config.safariBookmarks {
+                    body += "<a class='btn' href='menucycle://action/enable-safari'>Safari 북마크 연동하기</a>"
+                }
+                body += "</div>"
+            }
+        }
+
+        let crumbs = trail.enumerated().map { k, c in
+            k == trail.count - 1 && query.isEmpty
+                ? "<span>\(htmlEscape(c.title))</span>"
+                : "<a href='menucycle://bookmarks\(c.path.isEmpty ? "" : "?p=" + c.path)'>\(htmlEscape(c.title))</a>"
+        }.joined(separator: " <i>›</i> ")
+
+        return """
+        <!doctype html><html lang="ko"><head><meta charset="utf-8"><title>북마크</title>
+        <style>
+        :root{--bg:#f5f5f7;--fg:#1d1d1f;--sub:#6e6e73;--card:#fff;--line:#e5e5ea;--hover:#f0f0f3}
+        @media (prefers-color-scheme:dark){:root{--bg:#1c1c1e;--fg:#f5f5f7;--sub:#a1a1a6;--card:#2c2c2e;--line:#3a3a3c;--hover:#3a3a3c}}
+        *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,"Apple SD Gothic Neo",sans-serif;padding:20px 16px 40px}
+        .wrap{max-width:640px;margin:0 auto}
+        .top{display:flex;align-items:center;gap:10px;margin-bottom:14px}
+        .home{text-decoration:none;color:var(--sub);font-size:13px;white-space:nowrap}
+        form{flex:1} input{width:100%;height:34px;border-radius:17px;border:1px solid var(--line);background:var(--card);color:var(--fg);padding:0 14px;font-size:13px;outline:none}
+        .crumbs{font-size:15px;font-weight:600;margin:6px 4px 12px} .crumbs a{color:#0a84ff;text-decoration:none} .crumbs i{color:var(--sub);font-style:normal;margin:0 2px}
+        .list{background:var(--card);border-radius:12px;overflow:hidden;border:1px solid var(--line)}
+        .row{display:flex;align-items:center;gap:10px;padding:9px 12px;text-decoration:none;color:var(--fg);border-bottom:1px solid var(--line);min-width:0;flex:1}
+        .row:hover{background:var(--hover)}
+        .frow{display:flex;align-items:center;border-bottom:1px solid var(--line)} .frow .row{border-bottom:0}
+        .ic{width:22px;height:22px;border-radius:6px;background:var(--hover);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:var(--sub);flex:none}
+        .folder .ic{background:none;font-size:16px}
+        .t{flex:1;font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .u{font-size:11.5px;color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45%}
+        .del{font-size:11.5px;color:#ff453a;text-decoration:none;padding:0 12px}
+        .empty{color:var(--sub);font-size:13px;padding:16px;margin:0}
+        .note{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;font-size:12.5px;line-height:1.6;margin-bottom:12px}
+        .btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+        .btn{font-size:12.5px;padding:6px 12px;border-radius:8px;background:var(--card);border:1px solid var(--line);color:var(--fg);text-decoration:none}
+        </style></head><body><div class="wrap">
+        <div class="top"><a class="home" href="\(startPageURL)">‹ 새 탭</a>
+        <form action="menucycle://bookmarks"><input name="q" value="\(htmlEscape(query))" placeholder="북마크 검색"></form></div>
+        <div class="crumbs">\(query.isEmpty ? crumbs : "‘" + htmlEscape(query) + "’ 검색 결과")</div>
+        <div class="list">\(body)</div>
+        </div></body></html>
+        """
     }
 
     // MARK: 방문 기록 · 시크릿 탭
@@ -2711,6 +3082,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        if let u = navigationAction.request.url {
+            if u.scheme == "menucycle" && u.host == "action" {
+                decisionHandler(.cancel)
+                DispatchQueue.main.async { self.handlePageAction(u) }
+                return
+            }
+            if u.scheme == "x-apple.systempreferences" {
+                NSWorkspace.shared.open(u)
+                decisionHandler(.cancel)
+                return
+            }
+        }
         // ⌥(Option)+클릭한 링크는 시스템 기본 브라우저로
         if navigationAction.navigationType == .linkActivated,
            navigationAction.modifierFlags.contains(.option),
