@@ -1544,8 +1544,27 @@ func parseBookmarkHTML(_ html: String) -> [BMNode] {
 final class StartPageHandler: NSObject, WKURLSchemeHandler {
     var render: (URL) -> String = { _ in "" }
 
+    private var stopped = Set<ObjectIdentifier>()
+
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
         let url = task.request.url ?? URL(string: startPageURL)!
+        if url.host == "icon" {
+            let q = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "u" }?.value
+            let id = ObjectIdentifier(task)
+            SiteIcons.shared.icon(for: q.flatMap(URL.init(string:))) { [weak self] result in
+                DispatchQueue.main.async {
+                    guard let self, self.stopped.remove(id) == nil else { return }
+                    guard let (data, mime) = result else {
+                        task.didFailWithError(URLError(.fileDoesNotExist))
+                        return
+                    }
+                    task.didReceive(URLResponse(url: url, mimeType: mime, expectedContentLength: data.count, textEncodingName: nil))
+                    task.didReceive(data)
+                    task.didFinish()
+                }
+            }
+            return
+        }
         let data = Data(render(url).utf8)
         task.didReceive(URLResponse(url: url, mimeType: "text/html", expectedContentLength: data.count,
                                     textEncodingName: "utf-8"))
@@ -1553,9 +1572,111 @@ final class StartPageHandler: NSObject, WKURLSchemeHandler {
         task.didFinish()
     }
 
-    func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {}
+    func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {
+        stopped.insert(ObjectIdentifier(task))
+    }
 }
 let startPageHandler = StartPageHandler()
+
+/// 사이트의 실제 아이콘 받기 (크롬 새 탭처럼). 페이지의 apple-touch-icon / icon 중 가장 큰 것,
+/// 없으면 /favicon.ico. 받은 아이콘은 Application Support/MenuCycle/site-icons 에 저장해서 다시 받지 않음
+final class SiteIcons {
+    static let shared = SiteIcons()
+    private let queue = DispatchQueue(label: "menucycle.siteicons")
+    private var waiting: [String: [((Data, String)?) -> Void]] = [:]
+
+    private var dir: URL {
+        let d = ConfigStore.url.deletingLastPathComponent().appendingPathComponent("site-icons", isDirectory: true)
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }
+
+    func icon(for page: URL?, done: @escaping ((Data, String)?) -> Void) {
+        guard let page, let host = page.host?.lowercased() else { done(nil); return }
+        let file = dir.appendingPathComponent(host)
+        if let d = try? Data(contentsOf: file), let mime = SiteIcons.mime(d) { done((d, mime)); return }
+        queue.async {
+            if self.waiting[host] != nil { self.waiting[host]!.append(done); return }
+            self.waiting[host] = [done]
+            self.fetch(page) { data in
+                if let data { try? data.write(to: file, options: .atomic) }
+                let result = data.flatMap { d in SiteIcons.mime(d).map { (d, $0) } }
+                self.queue.async {
+                    let cbs = self.waiting.removeValue(forKey: host) ?? []
+                    cbs.forEach { $0(result) }
+                }
+            }
+        }
+    }
+
+    private func request(_ u: URL) -> URLRequest {
+        var r = URLRequest(url: u)
+        r.setValue(desktopUA, forHTTPHeaderField: "User-Agent")
+        r.timeoutInterval = 15
+        return r
+    }
+
+    private func fetch(_ page: URL, done: @escaping (Data?) -> Void) {
+        URLSession.shared.dataTask(with: request(page)) { data, resp, _ in
+            let base = resp?.url ?? page
+            var candidates: [(URL, Int)] = []
+            if let data, let html = String(data: data.prefix(400_000), encoding: .utf8) ?? String(data: data.prefix(400_000), encoding: .isoLatin1) {
+                candidates = SiteIcons.iconLinks(html, base: base)
+            }
+            if let origin = URL(string: "/favicon.ico", relativeTo: base)?.absoluteURL { candidates.append((origin, 1)) }
+            self.tryNext(candidates, done: done)
+        }.resume()
+    }
+
+    private func tryNext(_ list: [(URL, Int)], done: @escaping (Data?) -> Void) {
+        guard let (u, _) = list.first else { done(nil); return }
+        URLSession.shared.dataTask(with: request(u)) { data, resp, _ in
+            if let data, (resp as? HTTPURLResponse)?.statusCode == 200, data.count > 64,
+               SiteIcons.mime(data) != nil, let img = NSImage(data: data), img.isValid {
+                done(data)
+            } else {
+                self.tryNext(Array(list.dropFirst()), done: done)
+            }
+        }.resume()
+    }
+
+    /// <link rel="apple-touch-icon" | "icon" href=… sizes=…> 를 큰 순서로 (SVG는 제외)
+    static func iconLinks(_ html: String, base: URL) -> [(URL, Int)] {
+        guard let re = try? NSRegularExpression(pattern: "<link\\b[^>]*>", options: .caseInsensitive) else { return [] }
+        func attr(_ tag: String, _ name: String) -> String? {
+            let p = "\\b\(name)\\s*=\\s*(\"([^\"]*)\"|'([^']*)'|([^\\s>]+))"
+            guard let r = try? NSRegularExpression(pattern: p, options: .caseInsensitive),
+                  let m = r.firstMatch(in: tag, range: NSRange(tag.startIndex..., in: tag)) else { return nil }
+            for g in 2...4 { if let rg = Range(m.range(at: g), in: tag) { return String(tag[rg]) } }
+            return nil
+        }
+        var out: [(URL, Int)] = []
+        let ns = html as NSString
+        for m in re.matches(in: html, range: NSRange(location: 0, length: ns.length)) {
+            let tag = ns.substring(with: m.range)
+            guard let rel = attr(tag, "rel")?.lowercased(), rel.contains("icon"),
+                  let href = attr(tag, "href")?.replacingOccurrences(of: "&amp;", with: "&"),
+                  let u = URL(string: href, relativeTo: base)?.absoluteURL,
+                  !u.path.lowercased().hasSuffix(".svg"), !(attr(tag, "type") ?? "").contains("svg") else { continue }
+            var size = Int(attr(tag, "sizes")?.lowercased().split(separator: "x").first ?? "") ?? 32
+            if rel.contains("apple-touch-icon") { size = max(size, 180) }
+            out.append((u, size))
+        }
+        return out.sorted { $0.1 > $1.1 }
+    }
+
+    /// 이미지 종류 (PNG / ICO / JPEG / GIF / WebP 만 사용)
+    static func mime(_ d: Data) -> String? {
+        let b = [UInt8](d.prefix(12))
+        guard b.count >= 4 else { return nil }
+        if b[0] == 0x89 && b[1] == 0x50 { return "image/png" }
+        if b[0] == 0 && b[1] == 0 && b[2] == 1 && b[3] == 0 { return "image/x-icon" }
+        if b[0] == 0xFF && b[1] == 0xD8 { return "image/jpeg" }
+        if b[0] == 0x47 && b[1] == 0x49 { return "image/gif" }
+        if b.count >= 12 && b[0] == 0x52 && b[8] == 0x57 && b[9] == 0x45 { return "image/webp" }
+        return nil
+    }
+}
 
 func htmlEscape(_ s: String) -> String {
     s.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;")
@@ -1563,38 +1684,11 @@ func htmlEscape(_ s: String) -> String {
         .replacingOccurrences(of: "'", with: "&#39;")
 }
 
-/// 잘 알려진 사이트는 브랜드 색 아이콘, 나머지는 첫 글자 아이콘
+/// 사이트 아이콘을 받지 못했을 때 쓰는 첫 글자 아이콘
 func quickLinkIcon(_ link: QuickLink) -> String {
     let host = (URL(string: link.url.contains("://") ? link.url : "https://" + link.url)?.host ?? "").lowercased()
     func box(_ bg: String, _ inner: String) -> String {
         "<svg viewBox='0 0 64 64'><rect width='64' height='64' rx='16' fill='\(bg)'/>\(inner)</svg>"
-    }
-    if host.contains("music.youtube") {
-        return box("#ff0033", "<circle cx='32' cy='32' r='17' fill='none' stroke='#fff' stroke-width='3.5'/><path d='M28 24.5v15l12-7.5z' fill='#fff'/>")
-    }
-    if host.contains("youtube") {
-        return box("#ff0033", "<rect x='13' y='19' width='38' height='26' rx='8' fill='#fff'/><path d='M28 25.5v13l11-6.5z' fill='#ff0033'/>")
-    }
-    if host.contains("naver") {
-        return box("#03c75a", "<path d='M19 18h9.5l7.5 11.5V18H45v28h-9.5L28 34.5V46H19z' fill='#fff'/>")
-    }
-    if host.contains("gemini") {
-        return box("#ffffff", "<defs><linearGradient id='gm' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='#4285f4'/><stop offset='1' stop-color='#a142f4'/></linearGradient></defs><path d='M32 10c1.6 11.4 10.6 20.4 22 22-11.4 1.6-20.4 10.6-22 22-1.6-11.4-10.6-20.4-22-22 11.4-1.6 20.4-10.6 22-22z' fill='url(#gm)'/>")
-    }
-    if host.contains("google") {
-        return box("#ffffff", "<text x='32' y='44' text-anchor='middle' font-family='-apple-system,Helvetica,Arial' font-weight='700' font-size='34' fill='#4285f4'>G</text>")
-    }
-    if host.contains("instagram") {
-        return "<svg viewBox='0 0 64 64'><defs><linearGradient id='ig' x1='0' y1='1' x2='1' y2='0'><stop offset='0' stop-color='#feda75'/><stop offset='.35' stop-color='#fa7e1e'/><stop offset='.65' stop-color='#d62976'/><stop offset='1' stop-color='#4f5bd5'/></linearGradient></defs><rect width='64' height='64' rx='16' fill='url(#ig)'/><rect x='16' y='16' width='32' height='32' rx='10' fill='none' stroke='#fff' stroke-width='3.5'/><circle cx='32' cy='32' r='7.5' fill='none' stroke='#fff' stroke-width='3.5'/><circle cx='41.5' cy='22.5' r='2.2' fill='#fff'/></svg>"
-    }
-    if host.contains("spotify") {
-        return box("#1db954", "<path d='M18 25c9-3 20-2.5 28 2M20 32.5c7.5-2.3 16.5-1.8 23 1.8M22 39.5c6-1.7 12.5-1.3 18 1.4' fill='none' stroke='#000' stroke-width='3.6' stroke-linecap='round'/>")
-    }
-    if host.contains("chatgpt") || host.contains("openai") {
-        return box("#000000", "<text x='32' y='40' text-anchor='middle' font-family='-apple-system,Helvetica,Arial' font-weight='700' font-size='20' fill='#fff'>GPT</text>")
-    }
-    if host.contains("claude") {
-        return box("#d97757", "<g stroke='#fff' stroke-width='4' stroke-linecap='round'><path d='M32 16v32M16 32h32M20.7 20.7l22.6 22.6M43.3 20.7L20.7 43.3'/></g>")
     }
     let letter = htmlEscape(String(link.name.prefix(1)).uppercased())
     let colors = ["#5b8def", "#e5677d", "#f0a63c", "#4fb98a", "#9a6cf0", "#38a9c9"]
@@ -1606,7 +1700,10 @@ func quickLinkIcon(_ link: QuickLink) -> String {
 func startPageHTML(links: [QuickLink], engine: SearchEngine) -> String {
     let tiles = links.map { l -> String in
         let href = l.url.contains("://") ? l.url : "https://" + l.url
-        return "<a class='tile' href='\(htmlEscape(href))'><div class='ic'>\(quickLinkIcon(l))</div><div class='nm'>\(htmlEscape(l.name))</div></a>"
+        let iconSrc = "menucycle://icon?u=" + (href.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "")
+        return "<a class='tile' href='\(htmlEscape(href))'><div class='ic'>"
+            + "<img src='\(htmlEscape(iconSrc))' alt='' onerror=\"this.style.display='none';this.nextElementSibling.style.display='block'\">"
+            + "<span class='fb' style='display:none'>\(quickLinkIcon(l))</span></div><div class='nm'>\(htmlEscape(l.name))</div></a>"
     }.joined()
     let bookmarkTile = "<a class='tile' href='menucycle://bookmarks'><div class='ic'><svg viewBox='0 0 64 64'><rect width='64' height='64' rx='16' fill='#ffb800'/><path d='M32 15l5.3 10.8 11.9 1.7-8.6 8.4 2 11.8L32 42.2l-10.6 5.5 2-11.8-8.6-8.4 11.9-1.7z' fill='#fff'/></svg></div><div class='nm'>북마크</div></a>"
     let tpl = engine.searchURL("__Q__")?.absoluteString ?? "https://www.google.com/search?q=__Q__"
@@ -1626,7 +1723,10 @@ func startPageHTML(links: [QuickLink], engine: SearchEngine) -> String {
     .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:18px 10px;width:100%;max-width:560px}
     .tile{display:flex;flex-direction:column;align-items:center;gap:8px;text-decoration:none;color:var(--fg);padding:8px 4px;border-radius:14px}
     .tile:hover{background:rgba(127,127,127,.12)}
-    .ic{width:52px;height:52px;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.15)}
+    .ic{width:52px;height:52px;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.15);background:#fff;
+        display:flex;align-items:center;justify-content:center}
+    .ic img{width:34px;height:34px;object-fit:contain}
+    .ic .fb{width:100%;height:100%}
     .ic svg{width:100%;height:100%;display:block}
     .nm{font-size:12px;color:var(--sub);max-width:84px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .empty{color:var(--sub);font-size:13px}
