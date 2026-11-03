@@ -436,6 +436,19 @@ enum ConfigStore {
     }
 }
 
+/// 삭제 전에 한 번 더 묻기. '삭제'를 누르면 true
+func confirmDelete(_ title: String, _ detail: String = "삭제하면 되돌릴 수 없어요.") -> Bool {
+    let a = NSAlert()
+    a.alertStyle = .warning
+    a.messageText = title
+    a.informativeText = detail
+    let del = a.addButton(withTitle: "삭제")
+    del.hasDestructiveAction = true
+    a.addButton(withTitle: "취소").keyEquivalent = "\u{1b}"
+    NSApp.activate(ignoringOtherApps: true)
+    return a.runModal() == .alertFirstButtonReturn
+}
+
 func showAlert(_ title: String, _ text: String) {
     let a = NSAlert()
     a.messageText = title
@@ -866,7 +879,9 @@ struct SettingsView: View {
                         .buttonStyle(.borderless)
                         .help("아이콘 바꾸기")
                         Button {
-                            model.config.quickLinks.removeAll { $0.id == link.id }
+                            if confirmDelete("'\(link.name)' 바로가기를 삭제할까요?") {
+                                model.config.quickLinks.removeAll { $0.id == link.id }
+                            }
                         } label: {
                             Image(systemName: "trash")
                         }
@@ -893,7 +908,11 @@ struct SettingsView: View {
                 Button("크롬 · 웨일 · 엣지 북마크 가져오기…") { model.openBrowserImport?() }
                 Button("HTML 파일에서 가져오기…") { model.importBookmarks?() }
                 if model.importedBookmarkCount > 0 {
-                    Button("가져온 북마크 지우기 (\(model.importedBookmarkCount)개 묶음)") { model.clearImportedBookmarks?() }
+                    Button("가져온 북마크 지우기 (\(model.importedBookmarkCount)개 묶음)") {
+                        if confirmDelete("가져온 북마크를 모두 지울까요?", "브라우저나 파일에 있는 원래 북마크는 그대로예요.") {
+                            model.clearImportedBookmarks?()
+                        }
+                    }
                 }
                 Spacer()
             }
@@ -929,7 +948,9 @@ struct SettingsView: View {
                         }
                         .labelsHidden().frame(width: 104).help("자동 새로고침")
                         Button {
-                            model.removePage(page.id)
+                            if confirmDelete("'\(page.name)' 페이지를 삭제할까요?") {
+                                model.removePage(page.id)
+                            }
                         } label: {
                             Image(systemName: "trash")
                         }
@@ -2649,7 +2670,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         case "/import-html":
             importBookmarksHTML()
         case "/delete-import":
-            if let s = item?.first(where: { $0.name == "i" })?.value, let i = Int(s), bookmarks.imported.indices.contains(i) {
+            if let s = item?.first(where: { $0.name == "i" })?.value, let i = Int(s), bookmarks.imported.indices.contains(i),
+               confirmDelete("'\(bookmarks.imported[i].title)'을(를) 삭제할까요?", "가져온 북마크 \(bookmarks.imported[i].linkCount)개가 지워져요. 브라우저에 있는 원래 북마크는 그대로예요.") {
                 bookmarks.imported.remove(at: i)
                 bookmarks.save()
                 bookmarksChanged()
@@ -2704,6 +2726,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         NSApp.activate(ignoringOtherApps: true)
         let r = a.runModal()
         if r == .alertThirdButtonReturn, let e = existing {
+            guard confirmDelete("'\(e.name)' 바로가기를 삭제할까요?") else { return }
             try? FileManager.default.removeItem(at: SiteIcons.customFile(e.id.uuidString))
             model.config.quickLinks.removeAll { $0.id == e.id }
             return
