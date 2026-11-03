@@ -220,6 +220,7 @@ struct QuickLink: Codable, Identifiable, Equatable {
     var id = UUID()
     var name: String
     var url: String
+    var iconVersion: Int = 0 // 0 = 사이트 아이콘 자동, 1 이상 = 직접 고른 아이콘 (바꿀 때마다 +1, 화면 갱신용)
 }
 
 extension QuickLink {
@@ -228,6 +229,7 @@ extension QuickLink {
         id = (try? c.decodeIfPresent(UUID.self, forKey: .id)) ?? UUID()
         name = (try? c.decodeIfPresent(String.self, forKey: .name)) ?? ""
         url = (try? c.decodeIfPresent(String.self, forKey: .url)) ?? ""
+        iconVersion = (try? c.decodeIfPresent(Int.self, forKey: .iconVersion)) ?? 0
     }
 }
 
@@ -624,6 +626,7 @@ final class SettingsModel: ObservableObject {
     var openHistory: (() -> Void)?
     var importBookmarks: (() -> Void)?
     var openBrowserImport: (() -> Void)?
+    var editQuickLink: ((UUID) -> Void)?
     var clearImportedBookmarks: (() -> Void)?
     @Published var importedBookmarkCount = 0
     var reloadConfigFile: (() -> Void)?
@@ -855,6 +858,13 @@ struct SettingsView: View {
                         Image(systemName: "line.3.horizontal").foregroundStyle(.tertiary)
                         TextField("이름", text: $link.name).frame(width: 130)
                         TextField("https://", text: $link.url)
+                        Button {
+                            model.editQuickLink?(link.id)
+                        } label: {
+                            Image(systemName: link.iconVersion > 0 ? "photo.fill" : "photo")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("아이콘 바꾸기")
                         Button {
                             model.config.quickLinks.removeAll { $0.id == link.id }
                         } label: {
@@ -1549,7 +1559,15 @@ final class StartPageHandler: NSObject, WKURLSchemeHandler {
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
         let url = task.request.url ?? URL(string: startPageURL)!
         if url.host == "icon" {
-            let q = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "u" }?.value
+            let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+            if let cid = items?.first(where: { $0.name == "c" })?.value,
+               let d = try? Data(contentsOf: SiteIcons.customFile(cid)), let mime = SiteIcons.mime(d) {
+                task.didReceive(URLResponse(url: url, mimeType: mime, expectedContentLength: d.count, textEncodingName: nil))
+                task.didReceive(d)
+                task.didFinish()
+                return
+            }
+            let q = items?.first { $0.name == "u" }?.value
             let id = ObjectIdentifier(task)
             SiteIcons.shared.icon(for: q.flatMap(URL.init(string:))) { [weak self] result in
                 DispatchQueue.main.async {
@@ -1578,12 +1596,68 @@ final class StartPageHandler: NSObject, WKURLSchemeHandler {
 }
 let startPageHandler = StartPageHandler()
 
+/// 바로가기 편집 창의 아이콘 미리보기 · 이미지 고르기
+final class IconPicker: NSObject {
+    let preview = NSImageView()
+    private(set) var pngData: Data? // 새로 고른 아이콘 (128px PNG)
+    private(set) var cleared = false // '사이트 아이콘 쓰기'를 눌렀음
+
+    override init() {
+        super.init()
+        preview.imageScaling = .scaleProportionallyUpOrDown
+        preview.wantsLayer = true
+        preview.layer?.cornerRadius = 14
+        preview.layer?.masksToBounds = true
+        preview.layer?.borderWidth = 1
+        preview.layer?.borderColor = NSColor.separatorColor.cgColor
+        preview.image = NSImage(systemSymbolName: "globe", accessibilityDescription: "자동")
+    }
+
+    func load(_ file: URL) {
+        if let img = NSImage(contentsOf: file) { preview.image = img }
+    }
+
+    @objc func choose() {
+        let p = NSOpenPanel()
+        p.allowedContentTypes = [.image]
+        p.message = "바로가기 아이콘으로 쓸 이미지를 고르세요"
+        guard p.runModal() == .OK, let f = p.url, let img = NSImage(contentsOf: f) else { return }
+        // 128x128 PNG로 줄여서 저장 (가운데 맞춤)
+        let size = NSSize(width: 128, height: 128)
+        let out = NSImage(size: size)
+        out.lockFocus()
+        NSGraphicsContext.current?.imageInterpolation = .high
+        let s = img.size
+        let scale = min(size.width / max(s.width, 1), size.height / max(s.height, 1))
+        let w = s.width * scale, h = s.height * scale
+        img.draw(in: NSRect(x: (size.width - w) / 2, y: (size.height - h) / 2, width: w, height: h))
+        out.unlockFocus()
+        guard let tiff = out.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else { return }
+        pngData = png
+        cleared = false
+        preview.image = out
+    }
+
+    @objc func reset() {
+        pngData = nil
+        cleared = true
+        preview.image = NSImage(systemSymbolName: "globe", accessibilityDescription: "자동")
+    }
+}
+
 /// 사이트의 실제 아이콘 받기 (크롬 새 탭처럼). 페이지의 apple-touch-icon / icon 중 가장 큰 것,
 /// 없으면 /favicon.ico. 받은 아이콘은 Application Support/MenuCycle/site-icons 에 저장해서 다시 받지 않음
 final class SiteIcons {
     static let shared = SiteIcons()
     private let queue = DispatchQueue(label: "menucycle.siteicons")
     private var waiting: [String: [((Data, String)?) -> Void]] = [:]
+
+    static func customFile(_ id: String) -> URL {
+        let d = ConfigStore.url.deletingLastPathComponent().appendingPathComponent("site-icons", isDirectory: true)
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d.appendingPathComponent("custom-" + id)
+    }
 
     private var dir: URL {
         let d = ConfigStore.url.deletingLastPathComponent().appendingPathComponent("site-icons", isDirectory: true)
@@ -1700,11 +1774,15 @@ func quickLinkIcon(_ link: QuickLink) -> String {
 func startPageHTML(links: [QuickLink], engine: SearchEngine) -> String {
     let tiles = links.map { l -> String in
         let href = l.url.contains("://") ? l.url : "https://" + l.url
-        let iconSrc = "menucycle://icon?u=" + (href.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "")
-        return "<a class='tile' href='\(htmlEscape(href))'><div class='ic'>"
+        var iconSrc = "menucycle://icon?u=" + (href.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "")
+        if l.iconVersion > 0 { iconSrc += "&c=\(l.id.uuidString)&v=\(l.iconVersion)" }
+        return "<a class='tile' href='\(htmlEscape(href))'>"
+            + "<span class='ed' title='편집' onclick=\"event.preventDefault();event.stopPropagation();location.href='menucycle://action/edit-link?id=\(l.id.uuidString)'\">✎</span>"
+            + "<div class='ic'>"
             + "<img src='\(htmlEscape(iconSrc))' alt='' onerror=\"this.style.display='none';this.nextElementSibling.style.display='block'\">"
             + "<span class='fb' style='display:none'>\(quickLinkIcon(l))</span></div><div class='nm'>\(htmlEscape(l.name))</div></a>"
     }.joined()
+    let addTile = "<a class='tile add' href='menucycle://action/add-link' title='바로가기 추가'><div class='ic'><span>+</span></div><div class='nm'>추가</div></a>"
     let bookmarkTile = "<a class='tile' href='menucycle://bookmarks'><div class='ic'><svg viewBox='0 0 64 64'><rect width='64' height='64' rx='16' fill='#ffb800'/><path d='M32 15l5.3 10.8 11.9 1.7-8.6 8.4 2 11.8L32 42.2l-10.6 5.5 2-11.8-8.6-8.4 11.9-1.7z' fill='#fff'/></svg></div><div class='nm'>북마크</div></a>"
     let tpl = engine.searchURL("__Q__")?.absoluteString ?? "https://www.google.com/search?q=__Q__"
     return """
@@ -1721,7 +1799,11 @@ func startPageHTML(links: [QuickLink], engine: SearchEngine) -> String {
           padding:0 20px;font-size:15px;outline:none}
     input:focus{border-color:#0a84ff;box-shadow:0 0 0 3px rgba(10,132,255,.25)}
     .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:18px 10px;width:100%;max-width:560px}
-    .tile{display:flex;flex-direction:column;align-items:center;gap:8px;text-decoration:none;color:var(--fg);padding:8px 4px;border-radius:14px}
+    .tile{position:relative;display:flex;flex-direction:column;align-items:center;gap:8px;text-decoration:none;color:var(--fg);padding:8px 4px;border-radius:14px}
+    .ed{position:absolute;top:2px;right:6px;width:20px;height:20px;border-radius:10px;background:var(--card);border:1px solid var(--line);
+        font-size:11px;line-height:18px;text-align:center;color:var(--sub);opacity:0;transition:opacity .12s;cursor:pointer}
+    .tile:hover .ed{opacity:1}
+    .add .ic{background:transparent;box-shadow:none;border:1.5px dashed var(--line)} .add .ic span{font-size:26px;color:var(--sub)}
     .tile:hover{background:rgba(127,127,127,.12)}
     .ic{width:52px;height:52px;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.15);background:#fff;
         display:flex;align-items:center;justify-content:center}
@@ -1732,7 +1814,7 @@ func startPageHTML(links: [QuickLink], engine: SearchEngine) -> String {
     .empty{color:var(--sub);font-size:13px}
     </style></head><body>
     <form id="f"><input id="q" placeholder="검색어 또는 주소 입력" autocomplete="off"></form>
-    <div class="grid">\(bookmarkTile + tiles)</div>
+    <div class="grid">\(bookmarkTile + tiles + addTile)</div>
     <script>
     document.getElementById('f').addEventListener('submit', function(e){
       e.preventDefault();
@@ -1882,6 +1964,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         }
         model.importBookmarks = { [weak self] in self?.importBookmarksHTML() }
         model.openBrowserImport = { [weak self] in self?.openInAppTab(bookmarkImportURL) }
+        model.editQuickLink = { [weak self] id in
+            guard let self, let l = self.config.quickLinks.first(where: { $0.id == id }) else { return }
+            self.editQuickLink(l)
+        }
         model.clearImportedBookmarks = { [weak self] in
             self?.bookmarks.imported.removeAll()
             self?.bookmarks.save()
@@ -2568,6 +2654,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
                 bookmarks.save()
                 bookmarksChanged()
             }
+        case "/add-link":
+            editQuickLink(nil)
+        case "/edit-link":
+            let id = item?.first { $0.name == "id" }?.value.flatMap(UUID.init(uuidString:))
+            if let id, let link = config.quickLinks.first(where: { $0.id == id }) { editQuickLink(link) }
         case "/enable-safari":
             model.config.safariBookmarks = true
         case "/import-browser":
@@ -2576,6 +2667,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
                                    .split(separator: ",").map(String.init))
         default:
             break
+        }
+    }
+
+    /// 시작 페이지 바로가기 추가 / 편집: 이름, 주소, 아이콘(자동 = 사이트 아이콘, 또는 이미지 파일)
+    func editQuickLink(_ existing: QuickLink?) {
+        let picker = IconPicker()
+        if let e = existing, e.iconVersion > 0 { picker.load(SiteIcons.customFile(e.id.uuidString)) }
+
+        let a = NSAlert()
+        a.messageText = existing == nil ? "바로가기 추가" : "바로가기 편집"
+        a.addButton(withTitle: existing == nil ? "추가" : "저장")
+        a.addButton(withTitle: "취소")
+        if existing != nil { a.addButton(withTitle: "삭제") }
+
+        let v = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 132))
+        let url = NSTextField(frame: NSRect(x: 0, y: 106, width: 320, height: 24))
+        url.placeholderString = "주소 (예: netflix.com)"
+        url.stringValue = existing?.url ?? (currentWebView?.url.flatMap { $0.scheme == "menucycle" ? nil : $0.absoluteString } ?? "")
+        let name = NSTextField(frame: NSRect(x: 0, y: 76, width: 320, height: 24))
+        name.placeholderString = "이름 (비워 두면 주소에서 자동으로)"
+        name.stringValue = existing?.name ?? ""
+        picker.preview.frame = NSRect(x: 0, y: 0, width: 64, height: 64)
+        let choose = NSButton(title: "이미지 선택…", target: picker, action: #selector(IconPicker.choose))
+        choose.frame = NSRect(x: 76, y: 34, width: 130, height: 28)
+        let auto = NSButton(title: "사이트 아이콘 쓰기", target: picker, action: #selector(IconPicker.reset))
+        auto.frame = NSRect(x: 76, y: 4, width: 150, height: 28)
+        let hint = NSTextField(labelWithString: "PNG·JPG 등")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        hint.frame = NSRect(x: 212, y: 40, width: 100, height: 16)
+        [url, name, picker.preview, choose, auto, hint].forEach { v.addSubview($0) }
+        a.accessoryView = v
+        a.window.initialFirstResponder = existing == nil ? url : name
+
+        NSApp.activate(ignoringOtherApps: true)
+        let r = a.runModal()
+        if r == .alertThirdButtonReturn, let e = existing {
+            try? FileManager.default.removeItem(at: SiteIcons.customFile(e.id.uuidString))
+            model.config.quickLinks.removeAll { $0.id == e.id }
+            return
+        }
+        guard r == .alertFirstButtonReturn else { return }
+        var u = url.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !u.isEmpty else { return }
+        if !u.contains("://") { u = "https://" + u }
+        var n = name.stringValue.trimmingCharacters(in: .whitespaces)
+        if n.isEmpty {
+            n = URL(string: u)?.host?.replacingOccurrences(of: "www.", with: "") ?? u
+        }
+
+        var link = existing ?? QuickLink(name: n, url: u)
+        link.name = n
+        link.url = u
+        let file = SiteIcons.customFile(link.id.uuidString)
+        if let data = picker.pngData {
+            try? data.write(to: file, options: .atomic)
+            link.iconVersion += 1
+        } else if picker.cleared {
+            try? FileManager.default.removeItem(at: file)
+            link.iconVersion = 0
+        }
+        if let i = config.quickLinks.firstIndex(where: { $0.id == link.id }) {
+            model.config.quickLinks[i] = link
+        } else {
+            model.config.quickLinks.append(link)
         }
     }
 
