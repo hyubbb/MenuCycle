@@ -1023,49 +1023,116 @@ final class Updater {
     }
 
     /// manual: 설정에서 버튼을 눌렀을 때 (최신이어도 결과를 보여줌)
+    /// 1순위: 릴리스에 같이 올린 version.json (github.com 다운로드 주소라 API 횟수 제한이 없음)
+    /// 2순위: GitHub API (회사 등 여러 명이 같은 IP를 쓰면 1시간 60회 제한에 걸릴 수 있음)
     func check(manual: Bool) {
         if manual { setStatus("확인 중…", busy: true) }
-        get("releases/tags/latest") { [weak self] rel in
+        let base = "https://github.com/\(repo)/releases/download/latest/"
+        fetchJSON(URL(string: base + "version.json")!) { [weak self] info, _ in
+            guard let self else { return }
+            if let info, let sha = info["sha"] as? String {
+                self.zipURL = URL(string: base + "MenuCycle-app.zip")
+                let commits = (info["commits"] as? [[String: Any]] ?? []).compactMap { c -> (String, String)? in
+                    guard let s = c["sha"] as? String, let m = c["msg"] as? String else { return nil }
+                    return (s, m)
+                }
+                self.decide(latestSHA: sha, name: info["name"] as? String ?? "최신 빌드", manual: manual) { cur in
+                    // 지금 버전 다음에 생긴 커밋들 = 바뀐 점
+                    if let i = commits.firstIndex(where: { $0.0.hasPrefix(cur) || cur.hasPrefix($0.0) }) {
+                        return (i == 0, commits.prefix(i).map { $0.1 })
+                    }
+                    return (false, commits.prefix(15).map { $0.1 })
+                }
+                return
+            }
+            self.checkWithAPI(manual: manual)
+        }
+    }
+
+    /// 최신이면 true, 아니면 바뀐 점 목록
+    private func decide(latestSHA: String, name: String, manual: Bool,
+                        notesSince: (String) -> (Bool, [String])) {
+        let cur = currentSHA
+        if !cur.isEmpty && (latestSHA.hasPrefix(cur) || cur.hasPrefix(latestSHA)) {
+            setStatus(manual ? "최신 버전을 쓰고 있어요." : "", available: false)
+            return
+        }
+        guard cur.count >= 7 else {
+            setStatus("새 버전: \(name)", available: true, notes: [])
+            return
+        }
+        let (upToDate, notes) = notesSince(cur)
+        if upToDate {
+            setStatus(manual ? "최신 버전을 쓰고 있어요." : "", available: false)
+        } else {
+            setStatus("새 버전이 있어요: \(name)", available: true, notes: notes)
+        }
+    }
+
+    private func checkWithAPI(manual: Bool) {
+        fetchJSON(URL(string: "https://api.github.com/repos/\(repo)/releases/tags/latest")!) { [weak self] rel, err in
             guard let self else { return }
             guard let rel, let latestSHA = rel["target_commitish"] as? String else {
-                if manual { self.setStatus("확인하지 못했어요. 인터넷 연결을 확인하거나 잠시 후 다시 시도해 주세요.") }
+                if manual { self.setStatus("확인하지 못했어요. " + (err ?? "잠시 후 다시 시도해 주세요.")) }
                 return
             }
             let assets = rel["assets"] as? [[String: Any]] ?? []
             let zip = assets.first { ($0["name"] as? String) == "MenuCycle-app.zip" }
             self.zipURL = (zip?["browser_download_url"] as? String).flatMap(URL.init(string:))
-            let name = (rel["name"] as? String) ?? "최신 빌드"
-            let cur = self.currentSHA
-
-            if !cur.isEmpty && latestSHA.hasPrefix(cur) || cur.hasPrefix(latestSHA) && !cur.isEmpty {
-                self.setStatus(manual ? "최신 버전을 쓰고 있어요." : "", available: false)
-                return
-            }
             guard self.zipURL != nil else {
                 if manual { self.setStatus("새 빌드를 준비 중이에요. 몇 분 뒤에 다시 확인해 주세요.") }
                 return
             }
-            guard cur.count >= 7 else {
-                // 직접 빌드해서 기준 커밋을 모르는 경우
-                self.setStatus("새 버전: \(name)", available: true, notes: [])
+            let name = (rel["name"] as? String) ?? "최신 빌드"
+            let cur = self.currentSHA
+            guard cur.count >= 7, !(latestSHA.hasPrefix(cur) || cur.hasPrefix(latestSHA)) else {
+                self.decide(latestSHA: latestSHA, name: name, manual: manual) { _ in (false, []) }
                 return
             }
-            // 지금 버전과 최신 버전 사이의 변경 내역
-            self.get("compare/\(cur)...\(latestSHA)") { cmp in
+            self.fetchJSON(URL(string: "https://api.github.com/repos/\(self.repo)/compare/\(cur)...\(latestSHA)")!) { cmp, _ in
                 let status = cmp?["status"] as? String
-                if status == "behind" || status == "identical" {
-                    self.setStatus(manual ? "최신 버전을 쓰고 있어요." : "", available: false)
-                    return
-                }
                 let commits = cmp?["commits"] as? [[String: Any]] ?? []
                 let notes = commits.reversed().compactMap { c -> String? in
-                    let msg = (c["commit"] as? [String: Any])?["message"] as? String
-                    return msg?.components(separatedBy: "\n").first
+                    ((c["commit"] as? [String: Any])?["message"] as? String)?.components(separatedBy: "\n").first
                 }
-                self.setStatus("새 버전이 있어요: \(name)", available: true, notes: notes)
+                self.decide(latestSHA: latestSHA, name: name, manual: manual) { _ in
+                    (status == "behind" || status == "identical", notes)
+                }
             }
         }
     }
+
+    /// JSON 받기. 실패하면 사람이 읽을 수 있는 이유를 같이 돌려줌
+    private func fetchJSON(_ u: URL, _ done: @escaping ([String: Any]?, String?) -> Void) {
+        var req = URLRequest(url: u, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("MenuCycle-updater", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: req) { data, resp, error in
+            if let error {
+                done(nil, "네트워크 오류: \(error.localizedDescription)")
+                return
+            }
+            let http = resp as? HTTPURLResponse
+            let code = http?.statusCode ?? 0
+            guard code == 200, let data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                if (code == 403 || code == 429), http?.value(forHTTPHeaderField: "X-RateLimit-Remaining") == "0" {
+                    var when = "잠시 후"
+                    if let r = http?.value(forHTTPHeaderField: "X-RateLimit-Reset"), let t = Double(r) {
+                        let f = DateFormatter()
+                        f.dateFormat = "HH:mm"
+                        when = f.string(from: Date(timeIntervalSince1970: t)) + " 이후"
+                    }
+                    done(nil, "GitHub 확인 횟수 제한(1시간 60회)에 걸렸어요. 같은 인터넷(회사 등)을 쓰는 사람이 많으면 생길 수 있어요. \(when) 다시 시도해 주세요.")
+                } else {
+                    done(nil, "GitHub 응답 오류 (\(code)). 잠시 후 다시 시도해 주세요.")
+                }
+                return
+            }
+            done(obj, nil)
+        }.resume()
+    }
+
 
     /// zip을 받아 풀고, 앱이 꺼지면 교체 후 다시 실행하는 작은 스크립트를 띄운 뒤 앱을 종료
     func install() {
