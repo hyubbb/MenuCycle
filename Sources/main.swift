@@ -287,6 +287,8 @@ struct AppConfig: Codable, Equatable {
     // 창
     var position: WindowPosition = .statusItem
     var savedOrigin: [Double]? = nil
+    var savedOffset: [Double]? = nil      // '마지막으로 옮긴 위치'를 모니터 안의 상대 위치로 (왼쪽, 위쪽에서 떨어진 거리)
+    var openOnActiveScreen = true         // 마우스가 있는(지금 보고 있는) 모니터에서 열기
     var width: Double = 420
     var height: Double = 680
     var alwaysOnTop = true
@@ -371,6 +373,8 @@ extension AppConfig {
 
         position = v(.position, position)
         savedOrigin = try? c.decodeIfPresent([Double].self, forKey: .savedOrigin)
+        savedOffset = try? c.decodeIfPresent([Double].self, forKey: .savedOffset)
+        openOnActiveScreen = v(.openOnActiveScreen, openOnActiveScreen)
         width = v(.width, width)
         height = v(.height, height)
         alwaysOnTop = v(.alwaysOnTop, alwaysOnTop)
@@ -830,6 +834,10 @@ struct SettingsView: View {
             Section("위치와 크기") {
                 Picker("열리는 위치", selection: $model.config.position) {
                     ForEach(WindowPosition.allCases) { Text($0.title).tag($0) }
+                }
+                Picker("열리는 모니터", selection: $model.config.openOnActiveScreen) {
+                    Text("지금 보고 있는 모니터 (마우스가 있는 곳)").tag(true)
+                    Text("메뉴바 아이콘이 있는 모니터 / 마지막 위치 그대로").tag(false)
                 }
                 Stepper("너비: \(Int(model.config.width))", value: $model.config.width, in: 300...2400, step: 20)
                 Stepper("높이: \(Int(model.config.height))", value: $model.config.height, in: 300...1600, step: 20)
@@ -2430,42 +2438,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         panel.isVisible ? hidePanel() : showPanel()
     }
 
-    func positionPanel() {
-        let size = panel.frame.size
-        switch config.position {
-        case .remembered:
-            if let o = config.savedOrigin, o.count == 2 {
-                let p = NSPoint(x: o[0], y: o[1])
-                let r = NSRect(origin: p, size: size)
-                if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(r) }) {
-                    panel.setFrameOrigin(p)
-                    return
-                }
-            }
-            positionBelowStatusItem(size)
-        case .center:
-            let mouse = NSEvent.mouseLocation
-            let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
-            if let vf = screen?.visibleFrame {
-                panel.setFrameOrigin(NSPoint(x: vf.midX - size.width / 2, y: vf.midY - size.height / 2))
-            }
-        case .statusItem:
-            positionBelowStatusItem(size)
-        }
+    /// 마우스가 있는 모니터 = 지금 보고 있는 모니터
+    var activeScreen: NSScreen? {
+        let mouse = NSEvent.mouseLocation
+        return NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
     }
 
-    func positionBelowStatusItem(_ size: NSSize) {
-        if let btn = statusItem.button, let win = btn.window {
-            let r = win.convertToScreen(btn.convert(btn.bounds, to: nil))
-            let vf = (win.screen ?? NSScreen.main)?.visibleFrame ?? r
-            var x = r.midX - size.width / 2
-            var y = r.minY - size.height - 4
-            x = max(vf.minX + 8, min(x, vf.maxX - size.width - 8))
-            y = max(vf.minY + 8, y)
-            panel.setFrameOrigin(NSPoint(x: x, y: y))
-        } else if let vf = NSScreen.main?.visibleFrame {
-            panel.setFrameOrigin(NSPoint(x: vf.midX - size.width / 2, y: vf.maxY - size.height - 8))
+    func positionPanel() {
+        let size = panel.frame.size
+        let target = config.openOnActiveScreen ? activeScreen : nil
+        var origin: NSPoint?
+
+        switch config.position {
+        case .remembered:
+            if let t = target, let off = config.savedOffset, off.count == 2 {
+                // 같은 상대 위치를 지금 모니터에 적용
+                let vf = t.visibleFrame
+                origin = NSPoint(x: vf.minX + off[0], y: vf.maxY - off[1] - size.height)
+            } else if let o = config.savedOrigin, o.count == 2 {
+                let p = NSPoint(x: o[0], y: o[1])
+                if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(NSRect(origin: p, size: size)) }) {
+                    origin = p
+                }
+            }
+            if origin == nil { origin = belowStatusItem(size, on: target) }
+        case .center:
+            if let vf = (target ?? activeScreen)?.visibleFrame {
+                origin = NSPoint(x: vf.midX - size.width / 2, y: vf.midY - size.height / 2)
+            }
+        case .statusItem:
+            origin = belowStatusItem(size, on: target)
         }
+        guard var o = origin else { return }
+        // 화면 밖으로 나가지 않게
+        let r = NSRect(origin: o, size: size)
+        if let vf = (NSScreen.screens.first { $0.visibleFrame.intersects(r) } ?? target ?? NSScreen.main)?.visibleFrame {
+            o.x = max(vf.minX + 8, min(o.x, vf.maxX - size.width - 8))
+            o.y = max(vf.minY + 8, min(o.y, vf.maxY - size.height))
+        }
+        panel.setFrameOrigin(o)
+    }
+
+    /// 메뉴바 아이콘 바로 아래. 다른 모니터에서 열면 그 모니터 메뉴바의 같은 자리(오른쪽 끝에서 같은 거리) 아래
+    func belowStatusItem(_ size: NSSize, on target: NSScreen?) -> NSPoint? {
+        guard let btn = statusItem.button, let win = btn.window else {
+            guard let vf = (target ?? NSScreen.main)?.visibleFrame else { return nil }
+            return NSPoint(x: vf.maxX - size.width - 12, y: vf.maxY - size.height - 4)
+        }
+        let r = win.convertToScreen(btn.convert(btn.bounds, to: nil))
+        let iconScreen = win.screen ?? NSScreen.main
+        var midX = r.midX
+        let screen = target ?? iconScreen
+        if let t = target, let s = iconScreen, t != s {
+            midX = t.frame.maxX - (s.frame.maxX - r.midX)
+        }
+        guard let vf = screen?.visibleFrame else { return nil }
+        return NSPoint(x: midX - size.width / 2, y: vf.maxY - size.height - 4)
     }
 
     // MARK: NSWindowDelegate
@@ -2482,7 +2510,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     func windowDidMove(_ notification: Notification) {
         guard notification.object as? NSWindow === panel, !isApplying,
               config.position == .remembered, panel.isVisible else { return }
-        model.config.savedOrigin = [Double(panel.frame.origin.x), Double(panel.frame.origin.y)]
+        var c = model.config
+        c.savedOrigin = [Double(panel.frame.origin.x), Double(panel.frame.origin.y)]
+        if let vf = (panel.screen ?? NSScreen.main)?.visibleFrame {
+            c.savedOffset = [Double(panel.frame.minX - vf.minX), Double(vf.maxY - panel.frame.maxY)]
+        }
+        model.config = c
     }
 
     func windowWillClose(_ notification: Notification) {
